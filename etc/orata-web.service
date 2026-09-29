@@ -1,0 +1,34 @@
+# /etc/systemd/system/orata-web.service
+#
+#   sudo cp etc/orata-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now orata-web
+#   journalctl -u orata-web -f
+
+[Unit]
+Description=orata web admin
+After=asterisk.service
+Wants=asterisk.service
+
+[Service]
+Type=simple
+User=asterisk
+Group=asterisk
+ExecStart=/usr/bin/python3 /usr/local/bin/orata-web.py
+Restart=on-failure
+RestartSec=5
+
+# It needs the Asterisk CLI socket and its own config; nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/run/asterisk /var/log/orata
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
