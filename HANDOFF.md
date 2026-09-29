@@ -1,8 +1,11 @@
 # HANDOFF
 
-Session 1. Greenfield -> config repo written. **Nothing has been deployed or
-executed.** Every file here was authored on a Windows dev box and has never
-run on a Pi. Treat all of it as unverified.
+Session 3. **Asterisk is built, installed, running, and the inbound call
+logic has been executed and verified on the Pi.** See "Session 3 results"
+below for what is now proven vs still untested.
+
+Sessions 1-2 wrote this repo on a Windows box with nothing deployed. That is
+no longer the case.
 
 ---
 
@@ -196,10 +199,14 @@ an afternoon.
   `ORATA_ALEXA_CMD=speak` in `announce.conf`. Test with `*99`.
 - **`Read(digit,custom/press-one,1,,1,7)`** — argument order and the 7s
   timeout are untested against a live call.
-- **`custom/press-one` prompt does not exist yet.** README has espeak+sox
-  steps to generate it. Until then the gate will fail on unknown callers.
-- **CRLF.** Files authored on Windows. README has the `sed -i 's/\r$//'` fix;
-  if bash says `bad interpreter` or Asterisk misparses a config, that's why.
+- ~~**`custom/press-one` prompt does not exist yet.**~~ Generated and
+  verified playable in session 3. Note the path: source installs use
+  `/var/lib/asterisk/sounds/`, **not** `/usr/share/asterisk/sounds/`.
+- ~~**CRLF.**~~ Non-issue on this Pi: git checked out `i/lf w/lf`, and all
+  nine sources were confirmed LF-only. (Session 3 did find and fix a
+  *missing trailing newline* on `extensions.conf`, `pjsip.conf` and
+  `announce.conf` — appending to those files previously corrupted the last
+  line.)
 - **`local_net` in pjsip.conf** assumes 192.168/16 and 10/8. The
   `external_media_address` / `external_signaling_address` lines are commented
   out — uncomment **both** only if the Pi is behind NAT.
@@ -208,20 +215,76 @@ an afternoon.
 
 ---
 
-## Next session: do these in order
+## Session 3 results (on-Pi)
 
-The staging matters — it means a failure tells you which layer owns it.
+The Pi is **Raspberry Pi OS trixie = Debian 13**, not Debian 12. This
+invalidated step 2 below outright: **Asterisk is not in Debian 13.** Empty
+`apt-cache policy` version table, nothing from `madison`, reverse-deps-only
+`showpkg`. Bookworm was its last stable home.
+
+Resolved by building **Asterisk 22.11.0 LTS from source** (user's call, on
+the grounds that the packaging dependency was the debt that came due). Full
+rationale, configure line, and the maintenance obligation you now own:
+`docs/build-from-source.md`.
+
+### Verified by execution, not inspection
+
+These ran on the Pi against the real dialplan:
+
+- All 12 required modules built; 303 total; 368 sound files incl.
+  `vm-goodbye.gsm`
+- **astdb key agreement** — `cnam=[Mom] block=[1] allow=[1]
+  sensor=[orata-mom]` resolved through a live channel. The seam the test rig
+  called most likely to be wrong is correct.
+- **Known caller** skips the gate: `Set(CNAM=Mom)` -> `GotoIf(1?ring)` ->
+  `System()` fires -> `Dial(...)` -> `VoiceMail(100@default,u)`. No
+  `Answer()`, no `Read()`.
+- **Blocked caller**: `GotoIf(1?blocked)` -> `NoOp(BLOCKED)` -> `Hangup()` in
+  three priorities, **never answers**. Security property holds.
+- **Unknown caller** reaches `Read(digit,custom/press-one,1,,1,7)` and
+  announce correctly does *not* fire — robocalls never reach the Echos.
+- `System(... &)` -> `orata-announce.sh` fires from a real channel and exits
+  0 with `alexa SKIP` logged. **The no-daemon architecture works.**
+- `press-one.gsm` plays: `Playing 'custom/press-one.gsm' (language 'en')`
+- `orata-web.py` imports clean on Python 3.13 (uses none of the modules
+  trixie removed: `cgi`, `crypt`, `telnetlib`)
+
+### Still untested — needs real SIP
+
+- Registration to voip.ms (POP + credentials are still stubs; currently
+  `No response received from 'sip:newyork.voip.ms'`, which is expected)
+- RTP, audio, codec negotiation
+- Whether `Read()`'s 7s timeout feels right to a human caller
+- Anything Alexa (both paths need real credentials)
+
+## Next session: do these in order
 
 1. **voip.ms portal first.** Spending cap, block international dialing, create
    a sub-account for the trunk, enable IP whitelist. Before anything
    registers. This is the only irreversible mistake available; compromised
    PBXes get drained to premium-rate numbers overnight.
-2. `apt install asterisk curl jq`, deploy configs, fill in POP + passwords,
-   `core reload`, confirm `pjsip show registrations` shows `Registered`.
+2. Fill in POP + credentials in `/etc/asterisk/pjsip.conf`, `core reload`,
+   confirm `pjsip show registrations` shows `Registered`. (Asterisk itself is
+   already installed and running.)
 3. Get calls ringing on **one** softphone (MicroSIP on the PC). Ignore Alexa.
-4. Generate the `press-one` prompt, test the gate with an unknown caller.
-5. Only then: `alexa_remote_control.sh -a`, then dial `*99` to test the
-   announcement path in isolation.
+4. Test the gate with a real unknown caller — the prompt and `Read()` are
+   deployed and playable, but the timeout is unvalidated against a human.
+5. Only then: `alexa_remote_control.sh -a`, then dial `*99`.
+
+### Do these too (found in session 3)
+
+- **PSU.** `vcgencmd get_throttled` = `0x50000`: sticky under-voltage *and*
+  throttling since boot. Pi 4 under-voltage corrupts storage. Get a 5V/3A
+  supply.
+- **USB SSD.** Still booting from SD (`/dev/mmcblk0p2`), no USB disk
+  attached. The repo names SSD boot as an invariant; it is currently
+  violated.
+- **Verify the tarball signature.** Unresolved: keyserver unreachable, both
+  published key URLs 404. Provenance rests on TLS alone. Fingerprint and
+  SHA256 are in `docs/build-from-source.md` — check them from a machine with
+  keyserver access.
+- **Change the voicemail PIN.** Mailbox 100 was added to `[default]` in
+  `/etc/asterisk/voicemail.conf` with PIN `1357`.
 
 Path B (`docs/alexa-sensor.md`) is deliberately **not** on this list. Get the
 phone working on path A first; B is a swap-in for when the cookie dies, and

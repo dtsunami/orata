@@ -1,9 +1,63 @@
-# test/ — container verification rig
+# test/ — verification rigs
 
-**This is not a deployment target and never will be.** HANDOFF rejects Docker
-for running orata; that decision stands. This is a throwaway container on a
-dev box for checking that the configs parse and the scripts plumb together
-before anything reaches the Pi.
+Two things live here now:
+
+- **`selftest.conf`** — a dialplan context deployed *on the Pi* that drives
+  the real inbound paths with a spoofed caller ID. This is what actually
+  verified the call logic in session 3. See "On-Pi selftest" below.
+- **`Dockerfile` + `run-tests.sh`** — the original dev-box container rig.
+  **Now stale: it is `FROM debian:12`, and the Pi runs Debian 13 with
+  Asterisk built from source.** The drift this file warned about has
+  happened. Its results no longer transfer; two of its techniques were also
+  found to be wrong (see below).
+
+**Neither is a deployment target.** HANDOFF rejects Docker for running
+orata; that decision stands.
+
+## On-Pi selftest
+
+    sudo cp test/selftest.conf /etc/asterisk/orata-selftest.conf
+    sudo chown asterisk:asterisk /etc/asterisk/orata-selftest.conf
+    printf '\n#include "orata-selftest.conf"\n' | sudo tee -a /etc/asterisk/extensions.conf
+    sudo asterisk -rx 'dialplan reload'
+
+Note the leading `\n` in that `printf` — it matters. See the trailing-newline
+note in HANDOFF.
+
+The verbose log must be enabled or you will see nothing — `core set verbose`
+affects only the **console**, not logfiles. In `/etc/asterisk/logger.conf`:
+
+    orata.log => notice,warning,error,verbose(5)
+
+Then drive each path and watch `/var/log/asterisk/orata.log`:
+
+    sudo asterisk -rx 'channel originate Local/7101@orata-selftest application Wait 9'  # known
+    sudo asterisk -rx 'channel originate Local/7102@orata-selftest application Wait 9'  # blocked
+    sudo asterisk -rx 'channel originate Local/7103@orata-selftest application Wait 9'  # unknown
+    sudo asterisk -rx 'channel originate Local/7001@orata-selftest application Wait 2'  # DB() reads
+
+Remove the `#include` line when done, delete
+`/etc/asterisk/orata-selftest.conf`, and purge the test numbers from astdb.
+
+### Two testing techniques that DO NOT work
+
+Both were used by `run-tests.sh`, so treat its green runs with suspicion:
+
+1. **`dialplan eval function ${DB(...)}`** returns `Failure (-1)` outside a
+   channel on Asterisk 22 — even for keys `database get` reads back fine. It
+   cannot verify astdb/dialplan key agreement. Use a real channel.
+2. **`channel originate Local/NUM@from-voipms`** sets the *extension* to NUM
+   but leaves `CALLERID(num)` **empty**, so every
+   `DB(block/${CALLERID(num)})` lookup becomes `DB(block/)` and the whole
+   gate falls through. Every caller then looks identical. You must
+   `Set(CALLERID(num)=...)` first and `Goto()` in — which is what the 71xx
+   extensions in `selftest.conf` do.
+
+## The original container rig
+
+**This is not a deployment target and never will be.** A throwaway container
+on a dev box for checking that the configs parse and the scripts plumb
+together before anything reaches the Pi.
 
 No compose file, deliberately. One Dockerfile, one script, `--rm`.
 

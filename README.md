@@ -10,7 +10,7 @@ No Docker. No FreePBX. No Home Assistant. No daemon beyond Asterisk itself.
 
 | Thing | What it is | Breaks when |
 |---|---|---|
-| Asterisk 20 | `apt install asterisk` on Debian 12 | ~never (LTS, config stable) |
+| Asterisk 22 LTS | **built from source** — not packaged in Debian 13 | you must rebuild for CVEs yourself; see `docs/build-from-source.md` |
 | `orata-announce.sh` | bash + curl, fired by dialplan | never (it's 40 lines) |
 | `alexa_remote_control.sh` | third-party bash script | Amazon changes auth, ~annually |
 | ntfy | HTTP POST to a public topic | never |
@@ -35,9 +35,13 @@ happens and the switch is one line.
 
 ## Install
 
-On the Pi (Debian 12 arm64, **booted from USB SSD** — CDR logging kills SD cards):
+On the Pi (Debian 13 trixie arm64, **booted from USB SSD** — CDR logging kills SD cards):
 
-    sudo apt update && sudo apt install asterisk curl jq
+    sudo apt update && sudo apt install curl jq
+
+**Asterisk is not in Debian 13** — `apt install asterisk` fails with `no
+installation candidate`. It must be built from source. Do that first, then
+return here: `docs/build-from-source.md`.
 
 Copy this repo over, then:
 
