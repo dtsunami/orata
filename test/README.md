@@ -88,7 +88,7 @@ transfer:
   likely to be quietly wrong.
 - `orata-announce.sh` exits 0 and logs a skip in every degraded mode — the
   invariant that a broken notifier must never affect call handling
-- `orata-web.py` fails closed on empty token and on `0.0.0.0`; 401s
+- `orata_web.py` fails closed on empty token and on `0.0.0.0`; 401s
   unauthenticated GET **and** POST; its writes travel
   web → `orata-cnam.sh` → astdb → readable by the dialplan
 - `db_show()`'s regex actually matches real `database show` output

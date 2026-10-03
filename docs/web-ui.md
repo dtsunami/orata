@@ -1,9 +1,12 @@
 # Web UI
 
-`bin/orata-web.py` — a single stdlib-only Python file that edits the four
-astdb books through a browser. No framework, no pip, no venv, no database.
+`bin/orata_web.py` — a FastAPI app that edits the four astdb books through a
+browser, plus a read-only diagnostics page and a test harness.
 
-**Unverified.** Written on a Windows box, never run on the Pi.
+Installed from Debian packages (`python3-fastapi`, `python3-uvicorn`). No pip,
+no venv, no database.
+
+**Unverified.** Never run on the Pi.
 
 ## The tension, stated up front
 
@@ -14,7 +17,7 @@ being precise about which of them this inherits:
 | FreePBX objection | Does orata-web inherit it? |
 |---|---|
 | PHP app *owns* the configs, fights hand-editing | **No.** It shells out to `orata-cnam.sh`. The CLI stays authoritative; the UI is a second face on it. Nothing is generated, nothing is overwritten. |
-| Large dependency with its own upgrade cadence | **No.** Python 3 stdlib, already on Debian. ~280 lines you can read. |
+| Large dependency with its own upgrade cadence | **Partly.** It was stdlib-only; it is now FastAPI + uvicorn + starlette + pydantic, from Debian packages. They track the distro's cadence rather than their own, and `apt` upgrades them with everything else — but this is a real dependency that did not exist before, and it is the honest cost of the UI. |
 | Web attack surface | **Yes.** Unavoidably. |
 
 So the third one is real and has to be managed rather than argued away. It
@@ -43,9 +46,9 @@ WireGuard.
 
 ## Install
 
-    sudo cp bin/orata-web.py /usr/local/bin/
-    sudo chmod 755 /usr/local/bin/orata-web.py
-    sed -i 's/\r$//' /usr/local/bin/orata-web.py
+    sudo apt install python3-fastapi python3-uvicorn
+    sudo cp bin/orata_web.py /usr/local/bin/
+    sudo chmod 755 /usr/local/bin/orata_web.py
 
     sudo cp etc/web.conf /etc/orata/
     sudo chmod 600 /etc/orata/web.conf
@@ -106,7 +109,7 @@ live and typically increases traffic.
 ## Testing
 
     # does it start and refuse the obvious mistakes
-    sudo -u asterisk ORATA_WEB_CONF=/etc/orata/web.conf python3 /usr/local/bin/orata-web.py
+    sudo -u asterisk ORATA_WEB_CONF=/etc/orata/web.conf python3 /usr/local/bin/orata_web.py
 
 Empty token should exit 1 with a message. Then, with a token set:
 

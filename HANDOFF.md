@@ -52,7 +52,7 @@ asterisk/extensions.conf   inbound gate, announce hook, outbound, *99 test
 bin/orata-announce.sh      ntfy + Alexa notifier, backgrounded, always exit 0
 bin/orata-alexa-sensor.sh  Alexa path B sender: LWA token + ChangeReport
 bin/orata-cnam.sh          name book + allow/block lists + sensor map, astdb
-bin/orata-web.py           stdlib-only web admin for the astdb books
+bin/orata_web.py           FastAPI web admin + diagnostics + test harness
 etc/announce.conf          the only file tuned at runtime
 etc/web.conf               web UI bind address + admin token
 etc/orata-web.service      systemd unit for the web UI

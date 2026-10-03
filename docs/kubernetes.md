@@ -91,7 +91,7 @@ and the clearest candidate for staying on metal.
 
 The pieces that *are* cluster-shaped, if you ever want them:
 
-- `orata-web.py` — stateless except for reading astdb via the Asterisk CLI,
+- `orata_web.py` — stateless except for reading astdb via the Asterisk CLI,
   which is a local unix socket, so it must be co-located anyway. Not worth
   splitting.
 - ntfy, if you self-host it instead of using ntfy.sh. Genuinely stateless

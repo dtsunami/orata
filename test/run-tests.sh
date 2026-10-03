@@ -52,7 +52,7 @@ install -d -o asterisk -g asterisk /var/run/asterisk
 cp /repo/asterisk/extensions.conf /repo/asterisk/pjsip.conf /etc/asterisk/ \
     && ok "configs copied to /etc/asterisk" || no "config copy failed"
 cp /repo/bin/orata-cnam.sh /repo/bin/orata-announce.sh \
-   /repo/bin/orata-alexa-sensor.sh /repo/bin/orata-web.py /usr/local/bin/ \
+   /repo/bin/orata-alexa-sensor.sh /repo/bin/orata_web.py /usr/local/bin/ \
     && ok "scripts copied to /usr/local/bin" || no "script copy failed"
 cp /repo/etc/announce.conf /etc/orata/
 
@@ -76,10 +76,10 @@ for s in orata-cnam.sh orata-announce.sh orata-alexa-sensor.sh; do
     fi
 done
 
-if err="$(python3 -m py_compile /usr/local/bin/orata-web.py 2>&1)"; then
-    ok "py_compile orata-web.py"
+if err="$(python3 -m py_compile /usr/local/bin/orata_web.py 2>&1)"; then
+    ok "py_compile orata_web.py"
 else
-    no "py_compile orata-web.py -- $err"
+    no "py_compile orata_web.py -- $err"
 fi
 
 #=====================================================================
@@ -234,18 +234,18 @@ rc=$?
               || no "orata-alexa-sensor.sh exited $rc"
 
 #=====================================================================
-sect "orata-web.py"
+sect "orata_web.py"
 #=====================================================================
 
 printf 'ORATA_WEB_BIND=127.0.0.1\nORATA_WEB_PORT=8089\nORATA_WEB_TOKEN=\n' >/tmp/w-notoken.conf
-if ORATA_WEB_CONF=/tmp/w-notoken.conf timeout 10 python3 /usr/local/bin/orata-web.py >/dev/null 2>&1; then
+if ORATA_WEB_CONF=/tmp/w-notoken.conf timeout 10 python3 /usr/local/bin/orata_web.py >/dev/null 2>&1; then
     no "SECURITY: started with an empty token -- must fail closed"
 else
     ok "refuses to start with an empty token"
 fi
 
 printf 'ORATA_WEB_BIND=0.0.0.0\nORATA_WEB_PORT=8089\nORATA_WEB_TOKEN=x\n' >/tmp/w-any.conf
-if ORATA_WEB_CONF=/tmp/w-any.conf timeout 10 python3 /usr/local/bin/orata-web.py >/dev/null 2>&1; then
+if ORATA_WEB_CONF=/tmp/w-any.conf timeout 10 python3 /usr/local/bin/orata_web.py >/dev/null 2>&1; then
     no "SECURITY: bound 0.0.0.0 without the override flag"
 else
     ok "refuses to bind 0.0.0.0 without ORATA_WEB_ALLOW_ANY_BIND=1"
@@ -263,7 +263,7 @@ chown asterisk:asterisk /etc/orata/web.conf
 chmod 600 /etc/orata/web.conf
 
 su -s /bin/bash asterisk -c \
-  "ORATA_WEB_CONF=/etc/orata/web.conf python3 /usr/local/bin/orata-web.py" \
+  "ORATA_WEB_CONF=/etc/orata/web.conf python3 /usr/local/bin/orata_web.py" \
   >/tmp/web.log 2>&1 &
 WEBPID=$!
 for _ in $(seq 1 20); do

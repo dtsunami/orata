@@ -84,8 +84,14 @@ Then reboot.
 ## Verify
 
     findmnt /                  # want /dev/sda2
+    findmnt /boot/firmware     # want /dev/sda1
     vcgencmd get_throttled     # want 0x0
     lsblk -o NAME,SIZE,MODEL,TRAN
+
+If `/` is still `/dev/mmcblk0p2` but `/boot/firmware` is `/dev/sda1`, the
+firmware **did** boot off USB — the SSD's `cmdline.txt` just points `root=`
+at the SD's PARTUUID. That is the silent mismatch described below, not a
+boot-order problem, and no error is printed either way.
 
 **Pull the SD card once it boots clean off USB.** Keep it on a shelf as a
 rollback image; do not leave it in the slot.
@@ -97,7 +103,19 @@ Restart Asterisk and confirm the state store survived:
 
 ## If the clone stalls partway
 
-Some USB-SATA bridge chipsets drop offline under sustained writes — which is
+**Check the link speed before reaching for quirks.** A USB 2 link presents
+exactly like a flaky bridge — slow, and likelier to stall under sustained
+writes.
+
+    lsusb -t
+
+You want the disk on a **5000M** link. If it reads 480M, fix that first: a
+blue USB 3 port directly on the Pi, no hub, and a different cable. A USB 2
+link was the actual trigger here; adding a quirks entry at that point would
+have masked a cable problem rather than fixed it.
+
+Only once the link is 5000M and it *still* stalls is the bridge suspect. Some
+USB-SATA bridge chipsets drop offline under sustained writes — which is
 precisely the corruption you are migrating away from. Identify the bridge:
 
     lsusb
@@ -112,12 +130,26 @@ falls back to plain BOT, which is slower and does not hang.
 
 ## Unverified here
 
-This procedure was written from the session 3 findings and has not been
-executed on this Pi. The `rpi-clone` fstab/cmdline rewrite in particular is
-worth spot-checking by hand before the first reboot:
+Written from the session 3 findings and since partly executed: a clone has
+run, and `rpi-clone` was observed rewriting `/etc/fstab` correctly while
+leaving `cmdline.txt` pointing at the SD. The boot order change and a clean
+USB boot are still unconfirmed on this Pi.
 
+Spot-check both files by hand before the first reboot:
+
+`/boot/firmware` is a **separate FAT partition** (`sda1`), not part of the
+root filesystem. Mounting `sda2` alone leaves `/mnt/clone/boot/firmware`
+empty, so the `cat` returns nothing — which reads like a passing check rather
+than a skipped one.
+
+    sudo mkdir -p /mnt/clone
+    sudo mount -o ro /dev/sda2 /mnt/clone
+    sudo mount -o ro /dev/sda1 /mnt/clone/boot/firmware
     sudo cat /mnt/clone/etc/fstab
     sudo cat /mnt/clone/boot/firmware/cmdline.txt
+    sudo umount /mnt/clone/boot/firmware /mnt/clone
 
 Both should reference the SSD's PARTUUIDs, not the SD's. Compare against
-`blkid`.
+`blkid`. Read them as **two independent checks**: `rpi-clone` rewriting one
+correctly and leaving the other pointing at the SD is an observed failure,
+and the result boots the SSD kernel against the SD root silently.

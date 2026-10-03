@@ -115,12 +115,18 @@ maintenance burden.
 
 ## Web UI
 
-Optional. A single stdlib-only Python file (`orata-web.py`, no framework, no
-pip) that edits the name book, whitelist, blocklist and Alexa sensor map from
-a browser. It shells out to `orata-cnam.sh`, so the CLI stays authoritative
-and nothing is generated or overwritten.
+Optional. A FastAPI app (`orata_web.py`) that edits the name book, whitelist,
+blocklist and Alexa sensor map from a browser, and carries a diagnostics page
+and a test harness. It shells out to `orata-cnam.sh`, so the CLI stays
+authoritative and nothing is generated or overwritten.
 
-    sudo cp bin/orata-web.py /usr/local/bin/ && sudo chmod 755 /usr/local/bin/orata-web.py
+This is the one place the project takes a framework dependency. It is
+installed from Debian packages, not pip — trixie's python3 is
+PEP 668 externally-managed, so `pip install` into the system interpreter is
+refused, and a venv would be a second thing to maintain.
+
+    sudo apt install python3-fastapi python3-uvicorn
+    sudo cp bin/orata_web.py /usr/local/bin/ && sudo chmod 755 /usr/local/bin/orata_web.py
     sudo cp etc/web.conf /etc/orata/ && sudo chmod 600 /etc/orata/web.conf
     head -c 24 /dev/urandom | base64      # paste into ORATA_WEB_TOKEN
     sudo cp etc/orata-web.service /etc/systemd/system/

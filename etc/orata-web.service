@@ -4,6 +4,8 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now orata-web
 #   journalctl -u orata-web -f
+#
+# Requires: apt install python3-fastapi python3-uvicorn
 
 [Unit]
 Description=orata web admin
@@ -14,7 +16,7 @@ Wants=asterisk.service
 Type=simple
 User=asterisk
 Group=asterisk
-ExecStart=/usr/bin/python3 /usr/local/bin/orata-web.py
+ExecStart=/usr/bin/python3 /usr/local/bin/orata_web.py
 Restart=on-failure
 RestartSec=5
 
@@ -27,8 +29,8 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-ReadWritePaths=/var/run/asterisk /var/log/orata
-MemoryMax=128M
+ReadWritePaths=/var/run/asterisk /var/log/orata /var/lib/orata
+MemoryMax=192M
 
 [Install]
 WantedBy=multi-user.target
