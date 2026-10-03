@@ -273,12 +273,20 @@ These ran on the Pi against the real dialplan:
 
 ### Do these too (found in session 3)
 
-- **PSU.** `vcgencmd get_throttled` = `0x50000`: sticky under-voltage *and*
-  throttling since boot. Pi 4 under-voltage corrupts storage. Get a 5V/3A
-  supply.
-- **USB SSD.** Still booting from SD (`/dev/mmcblk0p2`), no USB disk
-  attached. The repo names SSD boot as an invariant; it is currently
-  violated.
+- ~~**PSU.**~~ Resolved. Was `0x50000` (sticky under-voltage + throttling);
+  reads `0x0` as of session 4. Re-check after any power or cable change —
+  the bits are sticky since boot, so a clean read only covers this boot.
+- ~~**USB SSD.**~~ Done and verified in session 4. `findmnt /` =
+  `/dev/sda2` on a 931.5G SanDisk Extreme Portable SSD, with **no SD card in
+  the slot** (`blkid` shows one disk, so no duplicate-PARTUUID ambiguity), and
+  root is 916G/8.5G used — resized to the full SSD, not stranded. The
+  invariant holds.
+
+  The disk was invisible on one USB port and booted first try on another; no
+  diagnosis was done. Note that `cmdline.txt` also carries
+  `usb-storage.quirks=0781:558c:u`, disabling UAS on that SanDisk bridge —
+  so the port fault and the UAS fault are plausibly one marginal link, not
+  two. Don't strip that quirk. See `docs/usb-ssd-boot.md`.
 - **Verify the tarball signature.** Unresolved: keyserver unreachable, both
   published key URLs 404. Provenance rests on TLS alone. Fingerprint and
   SHA256 are in `docs/build-from-source.md` — check them from a machine with

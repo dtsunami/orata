@@ -46,31 +46,70 @@ WireGuard.
 
 ## Install
 
-    sudo apt install python3-fastapi python3-uvicorn
-    sudo cp bin/orata_web.py /usr/local/bin/
-    sudo chmod 755 /usr/local/bin/orata_web.py
+One command, from the repo root on the Pi:
 
-    sudo cp etc/web.conf /etc/orata/
-    sudo chmod 600 /etc/orata/web.conf
-    sudo chown asterisk:asterisk /etc/orata/web.conf
+    sudo ./bin/orata-web-install.sh
 
-    # generate a token and paste it into ORATA_WEB_TOKEN
-    head -c 24 /dev/urandom | base64
+That installs the Debian packages, copies `orata_web.py` into
+`/usr/local/bin`, creates `/etc/orata`, `/var/log/orata` and `/var/lib/orata`
+with the right ownership, generates a 24-byte token, installs and starts the
+systemd unit, and prints the URL with the token already in it.
 
-    sudo cp etc/orata-web.service /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now orata-web
-    journalctl -u orata-web -f
+It is idempotent. Re-run it after editing the repo copy of `orata_web.py` and
+it reinstalls and restarts without touching your existing token.
 
-From your desktop:
+The directory creation is not optional detail: the unit sets
+`ProtectSystem=strict` with `ReadWritePaths=/var/run/asterisk /var/log/orata
+/var/lib/orata`, and systemd refuses to start a unit whose `ReadWritePaths`
+do not exist.
+
+### Choosing the bind address
+
+With no arguments the installer auto-detects the Pi's LAN address and binds
+that. The three options, narrowest first:
+
+    sudo ./bin/orata-web-install.sh --bind 127.0.0.1   # SSH tunnel only
+    sudo ./bin/orata-web-install.sh                    # auto-detected LAN IP
+    sudo ./bin/orata-web-install.sh --bind 0.0.0.0     # every interface
+
+**Binding a specific LAN or WireGuard IP needs no override flag** — the
+server only fails closed on the literal `0.0.0.0` and `::`. So the
+auto-detected default gives you browser access from any device on the LAN
+while keeping the guardrail intact. If the Pi's address comes from DHCP, give
+it a reservation or the bind will break on renewal.
+
+`--bind 0.0.0.0` sets `ORATA_WEB_ALLOW_ANY_BIND=1` for you and prints a
+warning. It exposes the UI on every interface including wifi and any guest
+VLAN. There is no TLS and no rate limit on the token; the UI runs as the
+`asterisk` user, so a compromise is a compromise of call routing on a trunk
+that can dial premium-rate numbers. It is defensible on a trusted home LAN
+with no port-forward, and indefensible anywhere else.
+
+For tunnel-only access from a desktop:
 
     ssh -L 8088:127.0.0.1:8088 pi@raspberrypi
 
-then browse `http://127.0.0.1:8088/?token=YOUR_TOKEN`. The token goes into a
-cookie; after that, plain `http://127.0.0.1:8088/`.
+then browse `http://127.0.0.1:8088/?token=YOUR_TOKEN`. The token goes into an
+HttpOnly cookie; after that, plain `http://127.0.0.1:8088/`.
 
-To reach it from a phone on WireGuard, set `ORATA_WEB_BIND` to the Pi's
-WireGuard address instead.
+## What the UI deliberately will not do
+
+It never writes a config file. Every mutation goes through
+`orata-cnam.sh` into astdb. This is the line between orata-web and FreePBX,
+which HANDOFF rejected for owning the configs and fighting hand-editing.
+
+So these stay hand-edited, and no amount of UI polish should absorb them:
+
+| Task | File |
+|---|---|
+| voip.ms POP + trunk credentials | `/etc/asterisk/pjsip.conf` |
+| voicemail PIN | `/etc/asterisk/voicemail.conf` |
+| Alexa mode, ntfy URL, LWA tokens | `/etc/orata/announce.conf` |
+| selftest context `#include` | `/etc/asterisk/extensions.conf` |
+
+The Diagnostics tab *detects and reports* every one of these — stubbed
+credentials, missing ntfy URL, selftest context not loaded — and tells you
+which file to edit. Reporting is the boundary.
 
 ## What it manages
 

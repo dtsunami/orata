@@ -128,19 +128,79 @@ If it is a known-bad bridge, add a quirks entry to the **single line** in
 using the vendor:product IDs from `lsusb`. The `u` flag disables UAS and
 falls back to plain BOT, which is slower and does not hang.
 
-## Unverified here
+## If the bootloader can't see the disk, try the other port
 
-Written from the session 3 findings and since partly executed: a clone has
-run, and `rpi-clone` was observed rewriting `/etc/fstab` correctly while
-leaving `cmdline.txt` pointing at the SD. The boot order change and a clean
-USB boot are still unconfirmed on this Pi.
+Reported empirically in session 4: the same SSD in the same enclosure would
+not boot from one port and booted first try from another. No diagnosis beyond
+that. **If the disk is invisible at boot, move it before you debug anything
+else** — this swallowed hours that went into EEPROM and clone theories.
 
-Spot-check both files by hand before the first reboot:
+Candidate causes, none confirmed here:
+
+- the blue USB 3.0 and black USB 2.0 ports enumerate differently, and some
+  SATA bridges only negotiate cleanly on one of them
+- marginal power delivery, especially with a bus-powered 2.5" drive
+- a bad socket or cable on one side
+
+After it boots, `lsblk -o NAME,SIZE,MODEL,TRAN` and `dmesg | grep -i usb`
+will say which link actually came up and whether it fell back.
+
+Note this interacts with the PSU section: a port that browns out under a
+drive's spin-up load looks exactly like a port that doesn't support boot.
+
+## The UAS quirk that is already live
+
+`/boot/firmware/cmdline.txt` on this Pi carries:
+
+    usb-storage.quirks=0781:558c:u
+
+`0781:558c` is the SanDisk bridge in the attached Extreme Portable SSD, and
+`:u` disables UAS per the "clone stalls partway" section above. Who added it
+is not recorded, but it is load-bearing — do not strip it while tidying
+`cmdline.txt`.
+
+It is probably the same fault as the port swap rather than a second one. A
+bridge that only enumerates on one port *and* needs UAS disabled is one
+marginal link presenting twice. The two sections above are written as separate
+problems; on this hardware they were likely not.
+
+## Status — verified session 4
+
+Confirmed by execution, SD card **out of the slot** (no `mmcblk*` present, so
+this is not the both-inserted case that proves nothing):
+
+    findmnt /          ->  /dev/sda2  ext4  rw,noatime
+    lsblk              ->  sda  931.5G  SanDisk Extreme Portable SSD  usb
+    blkid              ->  only sda1/sda2 exist; no second disk, no
+                           duplicate PARTUUID
+    df -h /            ->  916G total, 8.5G used, 1% — full-disk root,
+                           not stranded at the SD's size
+    vcgencmd get_throttled -> 0x0
+
+So all three of the old open items are closed: it really is booting off USB,
+the root filesystem really was resized to fill the SSD, and the PSU problem is
+gone (`0x50000` -> `0x0`, clean since last boot).
+
+`/etc/fstab` and `cmdline.txt` agree on `PARTUUID=af8a94c4-02`, and that is
+the only disk in `blkid`, so the duplicate-PARTUUID trap does not apply.
+
+**Still not recorded:** whether the SSD was `rpi-clone`d from the SD or
+flashed fresh with rpi-imager. `cmdline.txt` contains an
+`i=rpi-imager-1790647557738` tag, but `rpi-clone` copies that string through
+from the source disk, so it does not settle the question either way.
+
+### Pre-reboot spot-check — keep this for the next clone
+
+Recorded in session 3 and still the sharpest trap here: `rpi-clone` was
+observed rewriting `/etc/fstab` correctly **while leaving `cmdline.txt`
+pointing at the SD**. That combination boots the SSD's kernel against the SD's
+root filesystem and gives no error. Treat the two files as **two independent
+checks**, not one.
 
 `/boot/firmware` is a **separate FAT partition** (`sda1`), not part of the
 root filesystem. Mounting `sda2` alone leaves `/mnt/clone/boot/firmware`
 empty, so the `cat` returns nothing — which reads like a passing check rather
-than a skipped one.
+than a skipped one. Mount both:
 
     sudo mkdir -p /mnt/clone
     sudo mount -o ro /dev/sda2 /mnt/clone
@@ -150,6 +210,9 @@ than a skipped one.
     sudo umount /mnt/clone/boot/firmware /mnt/clone
 
 Both should reference the SSD's PARTUUIDs, not the SD's. Compare against
-`blkid`. Read them as **two independent checks**: `rpi-clone` rewriting one
-correctly and leaving the other pointing at the SD is an observed failure,
-and the result boots the SSD kernel against the SD root silently.
+`blkid`.
+
+On the currently running system this check has since passed — `/etc/fstab`
+and `cmdline.txt` both name `PARTUUID=af8a94c4-02`, and `blkid` reports only
+one disk. Whether the earlier mismatch was corrected or the SSD was
+ultimately flashed fresh is not recorded.
