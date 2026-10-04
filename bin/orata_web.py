@@ -359,6 +359,23 @@ pre{background:#0a0d11;border:1px solid #1b222a;border-radius:9px;padding:.8rem;
 .step.hit .ic{color:#2dd4bf}
 .step.end{background:#0f1319}
 .hint{font-size:.8rem;color:#6f7b8a;margin:.5rem 0 0}
+.snum{display:inline-flex;align-items:center;justify-content:center;width:1.4rem;
+ height:1.4rem;border-radius:50%;background:#1b222b;border:1px solid #2a3340;
+ color:#9aa4b2;font-size:.72rem;font-weight:700;flex:0 0 auto}
+.card.done>h2 .snum{background:#142926;border-color:#1f5c54;color:#2dd4bf}
+.card.now{border-color:rgba(245,166,35,.35)}
+.card.now>h2{background:#1d1a12}
+.card.done{opacity:.72}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:.3rem .9rem;font-size:.86rem;
+ margin:.6rem 0}
+.kv dt{color:#8a94a4}
+.kv dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+ word-break:break-all}
+.card .body p{margin:.5rem 0}
+.card .body p:first-child{margin-top:0}
+.card .body ol,.card .body ul{margin:.5rem 0;padding-left:1.2rem}
+.card .body li{margin:.25rem 0;font-size:.89rem}
+pre.cmd{background:#0a0d11;border-color:#223042;color:#cfe3dd;font-size:.8rem}
 footer{color:#5d6876;font-size:.78rem;margin-top:2rem;text-align:center}
 @media(max-width:34rem){nav a{padding:.35rem .5rem;font-size:.82rem}
  .chk{grid-template-columns:1fr}.chk .dt,.chk .hn{grid-column:1}}
@@ -389,7 +406,8 @@ orata <span class="tag">{{HOST}}</span></span>
 </div></body></html>
 """
 
-TABS = [("/", "Books"), ("/diag", "Diagnostics"), ("/harness", "Harness"), ("/log", "Log")]
+TABS = [("/setup", "Setup"), ("/devices", "Devices"), ("/", "Books"),
+        ("/diag", "Diagnostics"), ("/harness", "Harness"), ("/log", "Log")]
 
 
 def render(active, title, body, flash=""):
@@ -509,6 +527,12 @@ def page_books(request: Request, _=Depends(require_auth)):
         body.append('<div class="verdict bad"><b>Asterisk is not reachable.</b> '
                     "The books cannot be read or written. Check "
                     '<span class="mono">systemctl status asterisk</span>.</div>')
+    else:
+        pending = setup_incomplete()
+        if pending:
+            body.append('<div class="verdict bad"><b>Setup is not finished</b> &mdash; '
+                        '%s. Names added here will not be spoken until calls arrive. '
+                        '<a href="/setup">Open Setup</a>.</div>' % esc(pending))
     body += [render_book(*b) for b in BOOKS]
     return render("/", "orata - books", "".join(body), flash_of(request))
 
@@ -681,21 +705,17 @@ def diag_pjsip():
     else:
         out.append(chk("fail", "Trunk registration", "no registration object found",
                        "Check [voipms_reg] in %s" % PJSIP_CONF))
-    try:
-        with open(PJSIP_CONF) as fh:
-            conf = fh.read()
-        stubs = [lbl for needle, lbl in
-                 (("CHANGEME", "trunk password"), ("newyork.voip.ms", "POP hostname"),
-                  ("REPLACE_WITH_LONG_RANDOM", "endpoint password(s)"),
-                  ("123456_trunk", "sub-account username")) if needle in conf]
+    conf = pjsip_live_text()
+    if conf is None:
+        out.append(chk("skip", "voip.ms credentials", "cannot read " + PJSIP_CONF))
+    else:
+        stubs = pjsip_stubs()
         out.append(chk("fail", "voip.ms credentials", "still stubbed: " + ", ".join(stubs),
                        "Edit %s directly -- do NOT commit credentials to the repo."
                        % PJSIP_CONF) if stubs
                    else chk("pass", "voip.ms credentials", "no stub values remain"))
         if re.search(r"^\s*external_media_address", conf, re.M):
             out.append(chk("info", "NAT", "external_media_address is set"))
-    except OSError:
-        out.append(chk("skip", "voip.ms credentials", "cannot read " + PJSIP_CONF))
     return out
 
 
@@ -1144,6 +1164,556 @@ def act_reload(_=Depends(require_auth)):
              (out.strip()[:300] or "reloaded") if ok else out[:300])]
     return render("/harness", "orata - harness",
                   harness_body("", result_card("Asterisk reload", rows)))
+
+
+# =====================================================================
+# setup -- guided first-run walkthrough
+# =====================================================================
+
+STUBS = (("123456_trunk", "sub-account username"),
+         ("CHANGEME", "trunk password"),
+         ("newyork.voip.ms", "POP hostname"),
+         ("REPLACE_WITH_LONG_RANDOM", "device password(s)"))
+
+
+def pjsip_text():
+    """Raw file contents, or None if unreadable."""
+    try:
+        with open(PJSIP_CONF) as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def pjsip_live_text():
+    """Contents with ';' comments stripped.
+
+    The shipped header quotes every stub string verbatim --
+    '; REPLACE: newyork.voip.ms with your nearest POP' -- so a naive substring
+    search reports a fully configured file as still stubbed, forever.
+    Only live settings count.
+    """
+    conf = pjsip_text()
+    if conf is None:
+        return None
+    return "\n".join(re.sub(r";.*$", "", ln) for ln in conf.splitlines())
+
+
+def pjsip_stubs():
+    conf = pjsip_live_text()
+    if conf is None:
+        return []
+    return [lbl for needle, lbl in STUBS if needle in conf]
+
+
+def reg_status():
+    ok, regs = ast("pjsip show registrations")
+    if not ok:
+        return None
+    for line in regs.splitlines():
+        if "voipms" in line and "/sip:" in line:
+            m = re.search(r"(Registered|Unregistered|Rejected|Auth Sent|No Auth|"
+                          r"Stopped)", line)
+            return m.group(1) if m else line.strip()[-40:]
+    return None
+
+
+def device_contacts():
+    """Which of pc/mobile/desk have a live registration."""
+    ok, out = ast("pjsip show contacts")
+    if not ok:
+        return []
+    return [e for e in ("pc", "mobile", "desk") if "%s/sip:" % e in out]
+
+
+def lan_ip():
+    rc, out = sh(["hostname", "-I"], timeout=5)
+    if rc == 0 and out.strip():
+        return out.split()[0]
+    return BIND if BIND not in ("0.0.0.0", "::") else "THE-PI-IP"
+
+
+def setup_incomplete():
+    """Short reason string for the nudge banner, or '' when nothing is pending."""
+    if pjsip_stubs():
+        return "voip.ms credentials are still at their stub values"
+    if reg_status() != "Registered":
+        return "the trunk is not registered"
+    return ""
+
+
+def scard(num, title, state, body):
+    """state: done | now | todo"""
+    lbl = {"done": "pass", "now": "do this now", "todo": "waiting"}[state]
+    cls = {"done": "p-pass", "now": "p-warn", "todo": "p-skip"}[state]
+    return ('<div class="card %s"><h2><span class="snum">%s</span>%s'
+            '<span class="note"><span class="pill %s">%s</span></span></h2>'
+            '<div class="body">%s</div></div>'
+            % (state if state != "todo" else "", num, esc(title), cls, lbl, body))
+
+
+def setup_body():
+    stubs = pjsip_stubs()
+    reg = reg_status()
+    contacts = device_contacts()
+    acfg = load_conf(ANNOUNCE_CONF)
+    arc = acfg.get("ORATA_ARC", "/usr/local/bin/alexa_remote_control.sh")
+    arc_ok = os.access(arc, os.X_OK)
+    ntfy_ok = bool(acfg.get("ORATA_NTFY_URL"))
+    mode = acfg.get("ORATA_ALEXA_MODE", "arc")
+    ip = lan_ip()
+
+    done_creds = not stubs
+    done_reg = reg == "Registered"
+    done_dev = bool(contacts)
+    done_alexa = (mode == "off") or arc_ok or (mode in ("sensor", "both") and all(
+        acfg.get(k) for k in ("ORATA_LWA_CLIENT_ID", "ORATA_LWA_CLIENT_SECRET",
+                              "ORATA_LWA_REFRESH_TOKEN")))
+
+    # exactly one step is "now" -- the first unfinished one. The name book is
+    # "done" once it has any entry; it is never really finished, but an empty
+    # book is the state worth nudging about.
+    done_books = bool(db_show("cnam"))
+    pending = [not done_creds, not done_reg, not done_dev, not done_books,
+               not done_alexa]
+    first = next((i for i, p in enumerate(pending) if p), None)
+
+    def st(idx, done):
+        return "done" if done else ("now" if idx == first else "todo")
+
+    out = ['<h1>Setup</h1>',
+           '<p class="lede">Six steps from a running Asterisk to a ringing phone. '
+           'Each one checks itself &mdash; reload this page after you change '
+           'something and the state updates. This page never edits a file; it tells '
+           'you which file to edit and what to put in it.</p>']
+
+    if stubs:
+        out.append('<div class="verdict bad"><b>Not yet carrying calls.</b> '
+                   'Still stubbed in <span class="mono">%s</span>: %s.</div>'
+                   % (esc(PJSIP_CONF), esc(", ".join(stubs))))
+    elif done_reg:
+        out.append('<div class="verdict good"><b>Trunk is registered.</b> '
+                   'Inbound calls will reach the dialplan.</div>')
+
+    # ---- step 0 : the portal ----------------------------------------
+    out.append(scard(
+        "0", "voip.ms portal \u2014 do this before anything registers", "now" if first == 0
+        else "done",
+        '<p>This is the only step that can cost real money if skipped. A '
+        'compromised PBX gets drained to premium-rate numbers overnight. '
+        'Portal menu labels move around, so these are things to look for rather '
+        'than exact paths.</p>'
+        '<ul>'
+        '<li><b>Spending limit / auto-recharge cap.</b> Set a hard monthly ceiling.</li>'
+        '<li><b>Block international dialling.</b> Under account restrictions. If you '
+        'never call abroad, this removes the entire payoff of a breach.</li>'
+        '<li><b>Create a sub-account</b> for the trunk &mdash; <i>Sub Accounts \u2192 '
+        'Create Sub Account</i>. Device type SIP, auth User/Password. '
+        '<b>Never put your main login in pjsip.conf.</b> The username looks like '
+        '<span class="mono">123456_trunk</span>, where 123456 is your main account '
+        'number.</li>'
+        '<li><b>Allowed codecs</b> on the sub-account: <span class="mono">ulaw</span> '
+        'and <span class="mono">g722</span>, to match pjsip.conf.</li>'
+        '<li><b>IP whitelist</b> the Pi\u2019s public IP if it is static. Skip if your '
+        'ISP rotates it &mdash; a stale entry silently kills the trunk.</li>'
+        '<li><b>Route the DID</b> to the sub-account &mdash; <i>DID Numbers \u2192 '
+        'Manage DID</i>. A DID still pointed at the main account will never reach '
+        'this Pi.</li>'
+        '<li><b>Pick the nearest POP</b> and note its hostname, e.g. '
+        '<span class="mono">chicago.voip.ms</span>. Check latency from the Pi:</li>'
+        '</ul>'
+        '<pre class="cmd">ping -c3 chicago.voip.ms\nping -c3 newyork.voip.ms\nping -c3 seattle.voip.ms</pre>'
+        '<p class="hint">Lowest round-trip wins. The difference is audible on a '
+        'long call.</p>'))
+
+    # ---- step 1 : credentials ---------------------------------------
+    rows = "".join(
+        '<li><span class="mono">%s</span> &rarr; %s</li>' % (esc(n), esc(l))
+        for n, l in STUBS)
+    out.append(scard(
+        "1", "Put the credentials into pjsip.conf", st(0, done_creds),
+        ('<p>Four placeholder strings to replace. Every occurrence &mdash; the POP '
+         'hostname appears in four places and the username in three.</p>'
+         '<pre class="cmd">sudo nano %s</pre>'
+         '<ul>%s</ul>'
+         '<dl class="kv">'
+         '<dt>Portal field</dt><dd>pjsip.conf</dd>'
+         '<dt>Sub-account username</dt><dd>username / client_uri / from_user</dd>'
+         '<dt>Sub-account password</dt><dd>password=</dd>'
+         '<dt>POP hostname</dt><dd>contact / server_uri / client_uri / match</dd>'
+         '</dl>'
+         '<p>The three device passwords are yours to invent, not voip.ms\u2019s. '
+         'Generate one per device:</p>'
+         '<pre class="cmd">head -c 18 /dev/urandom | base64</pre>'
+         '<p class="hint">Dictionary attacks on <span class="mono">1001/1001</span> '
+         'are how most SIP boxes fall. These never get typed twice &mdash; paste them '
+         'into the softphone once.</p>'
+         + ('' if done_creds else
+            '<p class="hint"><b>Still present:</b> %s</p>' % esc(", ".join(stubs))))
+        % (esc(PJSIP_CONF), rows)))
+
+    # ---- step 2 : register ------------------------------------------
+    regtxt = esc(reg or "no registration object found")
+    out.append(scard(
+        "2", "Reload and confirm registration", st(1, done_reg),
+        '<p>Then reload &mdash; the <a href="/harness">Harness</a> tab has a '
+        '<b>core reload</b> button, or:</p>'
+        '<pre class="cmd">sudo asterisk -rx "core reload"\nsudo asterisk -rx "pjsip show registrations"</pre>'
+        '<dl class="kv"><dt>Current</dt><dd>%s</dd></dl>'
+        '<p>Want <span class="mono">Registered</span>. Common failures:</p>'
+        '<ul>'
+        '<li><span class="mono">Rejected</span> / <span class="mono">No Auth</span> '
+        '&mdash; wrong username or password, or the IP whitelist is blocking you.</li>'
+        '<li><span class="mono">No response received</span> &mdash; POP hostname is '
+        'wrong or unreachable.</li>'
+        '<li>Registered but no inbound audio &mdash; the Pi is behind NAT. Uncomment '
+        '<b>both</b> <span class="mono">external_media_address</span> and '
+        '<span class="mono">external_signaling_address</span>.</li>'
+        '</ul>' % regtxt))
+
+    # ---- step 3 : a phone -------------------------------------------
+    have = ", ".join(contacts) if contacts else "none registered yet"
+    out.append(scard(
+        "3", "Register one softphone", st(2, done_dev),
+        '<p>Every field you need is on the <a href="/devices"><b>Devices</b></a> tab '
+        '&mdash; server address, username, the actual password read from '
+        'pjsip.conf, and download links for MicroSIP, Linphone and Groundwire. '
+        'Start with the PC.</p>'
+        '<dl class="kv">'
+        '<dt>SIP server / domain</dt><dd>%s</dd>'
+        '<dt>Transport</dt><dd>UDP</dd>'
+        '<dt>Registered now</dt><dd>%s</dd>'
+        '</dl>'
+        '<p>Then dial <span class="mono">*99</span> from the softphone to fire a test '
+        'announcement, and call your DID from a mobile. Ignore Alexa until that '
+        'works.</p>'
+        '<p class="hint">Remote phones belong on WireGuard. Do not forward 5060.</p>'
+        % (esc(ip), esc(have))))
+
+    # ---- step 4 : the books -----------------------------------------
+    out.append(scard(
+        "4", "Load the name book", "now" if first == 3 else "todo",
+        '<p>A number in the <b>Name book</b> gets its name spoken and skips the '
+        'robocall gate. Everyone else is asked to press 1, once, and is remembered '
+        'after that.</p>'
+        '<ul>'
+        '<li>Add family and anyone who must never be gated &mdash; '
+        '<a href="/">Books</a> tab.</li>'
+        '<li>Enter numbers <b>exactly as voip.ms presents them</b>, normally 11 '
+        'digits: <span class="mono">15551234567</span>. The wrong format fails '
+        'silently.</li>'
+        '<li>Unsure? Use the <a href="/harness">call simulator</a> &mdash; it traces '
+        'any number through the dialplan against live state without placing a '
+        'call.</li>'
+        '</ul>'
+        '<p class="hint">After a real call, the Asterisk console and '
+        '<span class="mono">announce.log</span> show the exact digits that '
+        'arrived. Copy from there.</p>'))
+
+    # ---- step 5 : announcements -------------------------------------
+    alexa_rows = (
+        '<dl class="kv"><dt>Mode</dt><dd>%s</dd><dt>ARC script</dt><dd>%s</dd>'
+        '<dt>ntfy</dt><dd>%s</dd></dl>'
+        % (esc(mode), "installed" if arc_ok else esc("missing: " + arc),
+           "configured" if ntfy_ok else "not set"))
+    out.append(scard(
+        "5", "Announcements", st(4, done_alexa),
+        '<p>Edit <span class="mono">%s</span>:</p>'
+        '<pre class="cmd">sudo nano %s</pre>'
+        '%s'
+        '<p><b>ntfy first</b> &mdash; set <span class="mono">ORATA_NTFY_URL</span> to '
+        '<span class="mono">https://ntfy.sh/</span> plus a long unguessable topic. '
+        'It never breaks, and it is what still works when Amazon auth rots. Public '
+        'topics are readable by anyone who guesses the name.</p>'
+        '<p><b>Then Alexa.</b> Fetch '
+        '<span class="mono">alexa_remote_control.sh</span>, install it to '
+        '<span class="mono">%s</span>, then authenticate <b>as the asterisk '
+        'user</b> or the cookie lands in the wrong home directory:</p>'
+        '<pre class="cmd">sudo -u asterisk %s -a</pre>'
+        '<p>That starts a proxy on port 5601; log in to Amazon from a LAN browser. '
+        'Verify with the <b>fire announcement</b> button on '
+        '<a href="/harness">Harness</a>, then dial <span class="mono">*99</span>.</p>'
+        '<p class="hint">Two Alexa traps: Do Not Disturb suppresses announcements '
+        'entirely, and announcement volume follows device volume &mdash; an overnight '
+        'volume routine makes calls inaudible.</p>'
+        % (esc(ANNOUNCE_CONF), esc(ANNOUNCE_CONF), alexa_rows, esc(arc), esc(arc))))
+
+    # ---- housekeeping ------------------------------------------------
+    out.append('<div class="card"><h2>Before you call it done</h2><div class="body">'
+               '<ul>'
+               '<li><b>Change the voicemail PIN.</b> Mailbox 100 ships with '
+               '<span class="mono">1357</span> in '
+               '<span class="mono">/etc/asterisk/voicemail.conf</span>.</li>'
+               '<li><b>Remove the selftest include</b> from '
+               '<span class="mono">extensions.conf</span> if you added it, and purge '
+               'the test numbers from the books.</li>'
+               '<li><b>Confirm no port-forward</b> reaches this Pi on 5060. Inbound '
+               'calls ride the outbound registration; nothing needs opening.</li>'
+               '<li>Run <a href="/diag">Diagnostics</a> once more &mdash; it should be '
+               'free of failures.</li>'
+               '</ul></div></div>')
+    return "".join(out)
+
+
+@app.get("/setup", response_class=HTMLResponse)
+def page_setup(request: Request, _=Depends(require_auth)):
+    up, _v = asterisk_up()
+    if not up:
+        body = ('<h1>Setup</h1><div class="verdict bad"><b>Asterisk is not '
+                'reachable.</b> Nothing below can be checked. '
+                '<span class="mono">systemctl status asterisk</span></div>')
+    else:
+        body = setup_body()
+    return render("/setup", "orata - setup", body, flash_of(request))
+
+
+# =====================================================================
+# devices -- softphone connection details, read-only
+# =====================================================================
+
+CLIENT_LINKS = (
+    ("MicroSIP", "https://www.microsip.org/downloads", "Windows",
+     "The portable build needs no install. Start here."),
+    ("Linphone", "https://www.linphone.org/", "Linux / macOS / Windows",
+     "Free, cross-platform."),
+    ("Groundwire", "https://www.acrobits.net/groundwire/", "iOS / Android",
+     "Paid, around $10. The only mobile client with reliable push for a "
+     "self-hosted PBX -- free ones miss calls when backgrounded."),
+)
+
+PORTAL_LINKS = (
+    ("voip.ms portal", "https://voip.ms/m/index.php", ""),
+    ("Sub accounts", "https://voip.ms/m/subaccount.php",
+     "Where the trunk credentials come from. Never use the main login."),
+    ("Manage DID", "https://voip.ms/m/managedid.php",
+     "Point the DID at the sub-account, or inbound calls never reach this Pi."),
+    ("Server / POP list", "https://voip.ms/m/serverinfo.php",
+     "Hostnames for the latency check."),
+)
+
+# Order matters only for display.
+DEVICE_HINTS = {
+    "pc": "Desktop softphone -- MicroSIP or Linphone.",
+    "mobile": "Phone -- Groundwire. Over WireGuard when away from home.",
+    "desk": "Hardware desk phone, or a third softphone.",
+}
+
+
+def pjsip_sections():
+    """name -> {key: value}, merged across repeated [name] blocks.
+
+    pjsip.conf declares each device three times -- endpoint, auth, aor -- all
+    under the same section name. Merging them is what lets one card show the
+    whole device.
+    """
+    conf = pjsip_text()
+    if conf is None:
+        return {}
+    secs, cur = {}, None
+    for raw in conf.splitlines():
+        line = re.sub(r";.*$", "", raw).strip()
+        if not line:
+            continue
+        m = re.match(r"^\[([^\]]+)\]", line)
+        if m:
+            cur = m.group(1)
+            secs.setdefault(cur, {})
+            continue
+        if cur and "=" in line:
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k in secs[cur]:
+                secs[cur][k] = secs[cur][k] + ", " + v   # allow=ulaw, allow=g722
+            else:
+                secs[cur][k] = v
+    return secs
+
+
+def contact_map():
+    """endpoint -> (status, rtt, uri) for whatever is currently registered."""
+    ok, out = ast("pjsip show contacts")
+    cmap = {}
+    if not ok:
+        return cmap
+    for line in out.splitlines():
+        # The header row ("Contact:  <Aor/ContactUri...> <Hash> <Status>") also
+        # satisfies the shape, so require a real sip: URI.
+        m = re.match(r"\s*Contact:\s+([^/\s<]+)/(sip:\S+)\s+\S+\s+(\S+)\s*([\d.]+)?",
+                     line)
+        if m:
+            cmap[m.group(1)] = (m.group(3), m.group(4) or "", m.group(2))
+    return cmap
+
+
+def kvdump(d, title="all parsed settings"):
+    rows = "".join('<dt>%s</dt><dd>%s</dd>' % (esc(k), esc(v))
+                   for k, v in sorted(d.items()))
+    return ('<details><summary class="hint" style="cursor:pointer">%s</summary>'
+            '<dl class="kv">%s</dl></details>' % (esc(title), rows))
+
+
+def device_card(name, sec, cmap, ip):
+    cid = sec.get("callerid", "")
+    m = re.search(r"<(\d+)>", cid)
+    ext = m.group(1) if m else "?"
+    user = sec.get("username", name)
+    pw = sec.get("password", "")
+    status, rtt, uri = cmap.get(name, ("", "", ""))
+
+    if status.startswith("Avail"):
+        badge = '<span class="pill p-pass">registered</span>'
+        live = ('<dl class="kv"><dt>Contact</dt><dd>%s</dd>'
+                '<dt>Round trip</dt><dd>%s ms</dd></dl>'
+                % (esc(uri), esc(rtt or "n/a")))
+    elif status:
+        badge = '<span class="pill p-warn">%s</span>' % esc(status)
+        live = ""
+    else:
+        badge = '<span class="pill p-skip">not registered</span>'
+        live = ""
+
+    pwblock = ('<details><summary class="hint" style="cursor:pointer">'
+               'show password</summary><pre class="cmd">%s</pre></details>'
+               % esc(pw)) if pw else '<span class="dim">not set</span>'
+
+    return ('<div class="card"><h2>%s &mdash; extension %s'
+            '<span class="note">%s</span></h2><div class="body">'
+            '<p>%s</p>'
+            '<dl class="kv">'
+            '<dt>SIP server</dt><dd>%s</dd>'
+            '<dt>Domain</dt><dd>%s</dd>'
+            '<dt>Port</dt><dd>5060</dd>'
+            '<dt>Username / Login</dt><dd>%s</dd>'
+            '<dt>Display name</dt><dd>%s</dd>'
+            '<dt>Transport</dt><dd>%s</dd>'
+            '<dt>Codecs</dt><dd>%s</dd>'
+            '<dt>Password</dt><dd>%s</dd>'
+            '</dl>%s%s</div></div>'
+            % (esc(name), esc(ext), badge,
+               esc(DEVICE_HINTS.get(name, "")),
+               esc(ip), esc(ip), esc(user), esc(cid) or esc(name),
+               esc(sec.get("transport", "transport-udp").replace("transport-", "").upper()),
+               esc(sec.get("allow", "ulaw, g722")),
+               pwblock, live, kvdump(sec)))
+
+
+def devices_body():
+    secs = pjsip_sections()
+    cmap = contact_map()
+    ip = lan_ip()
+    out = ['<h1>Devices</h1>',
+           '<p class="lede">Every field a softphone asks for, read live from '
+           '<span class="mono">%s</span>. Nothing on this page is editable &mdash; '
+           'changing a device means editing that file and running '
+           '<span class="mono">pjsip reload</span>.</p>' % esc(PJSIP_CONF)]
+
+    if not secs:
+        out.append('<div class="verdict bad"><b>Cannot read %s.</b> The web UI runs as '
+                   'the <span class="mono">asterisk</span> user and the file is mode '
+                   '640 &mdash; check ownership.</div>' % esc(PJSIP_CONF))
+        return "".join(out)
+
+    out.append('<div class="card"><h2>MicroSIP &mdash; field by field</h2>'
+               '<div class="body">'
+               '<p>Menu (&#9776;, top right) &rarr; <b>Add Account</b>. '
+               'Leave anything not listed at its default.</p>'
+               '<dl class="kv">'
+               '<dt>Account Name</dt><dd>orata <span class="dim">(just a label)</span></dd>'
+               '<dt>SIP Server</dt><dd>%s</dd>'
+               '<dt>SIP Proxy</dt><dd><span class="dim">leave empty</span></dd>'
+               '<dt>Username</dt><dd>the device username below</dd>'
+               '<dt>Domain</dt><dd>%s</dd>'
+               '<dt>Login</dt><dd>same as Username</dd>'
+               '<dt>Password</dt><dd>from the device card below</dd>'
+               '<dt>Transport</dt><dd>UDP</dd>'
+               '</dl>'
+               '<p>Status bottom-left should reach <b>Online</b> within a few seconds. '
+               'Then dial <span class="mono">*99</span> for a test announcement.</p>'
+               '<p class="hint">This Pi answers on more than one address. Use '
+               '<span class="mono">%s</span> &mdash; the one serving this page.</p>'
+               '</div></div>' % (esc(ip), esc(ip), esc(ip)))
+
+    devs = [(n, s) for n, s in secs.items()
+            if "callerid" in s and "auth" in s]
+    order = {"pc": 0, "mobile": 1, "desk": 2}
+    devs.sort(key=lambda t: (order.get(t[0], 9), t[0]))
+    for name, sec in devs:
+        out.append(device_card(name, sec, cmap, ip))
+
+    pwset = {s.get("password") for _n, s in devs if s.get("password")}
+    if len(pwset) == 1 and len(devs) > 1:
+        out.append('<div class="verdict bad"><b>All devices share one password.</b> '
+                   'A leaked softphone config hands over every extension. Give each '
+                   'its own: <span class="mono">head -c 18 /dev/urandom | base64</span>'
+                   '</div>')
+
+    # --- clients ---
+    rows = "".join(
+        '<div class="chk"><span class="pill p-info">%s</span>'
+        '<span class="nm"><a href="%s" target="_blank" rel="noreferrer">%s</a></span>'
+        '<span class="dt">%s</span></div>' % (esc(plat), esc(url), esc(nm), esc(note))
+        for nm, url, plat, note in CLIENT_LINKS)
+    out.append('<div class="card"><h2>Softphone downloads</h2>'
+               '<div class="body flush">%s</div></div>' % rows)
+
+    # --- trunk ---
+    tr = secs.get("voipms", {})
+    auth = secs.get("voipms_auth", {})
+    aor = secs.get("voipms_aor", {})
+    ident = secs.get("voipms_identify", {})
+    reg = reg_status()
+    rbadge = ('<span class="pill p-pass">registered</span>' if reg == "Registered"
+              else '<span class="pill p-fail">%s</span>' % esc(reg or "not registered"))
+    out.append('<div class="card"><h2>voip.ms trunk<span class="note">%s</span></h2>'
+               '<div class="body">'
+               '<dl class="kv">'
+               '<dt>Sub-account</dt><dd>%s</dd>'
+               '<dt>POP (contact)</dt><dd>%s</dd>'
+               '<dt>from_domain</dt><dd>%s</dd>'
+               '<dt>identify match</dt><dd>%s</dd>'
+               '<dt>Codecs</dt><dd>%s</dd>'
+               '</dl>'
+               '<p class="hint"><b>identify match</b> is how inbound calls are '
+               'recognised as coming from the trunk. If it does not equal the POP, '
+               'calls never enter <span class="mono">[from-voipms]</span> &mdash; the '
+               'gate, the name book and announcements are all bypassed, while '
+               'registration still reports fine.</p>%s</div></div>'
+               % (rbadge, esc(auth.get("username", "?")),
+                  esc(aor.get("contact", "?")), esc(tr.get("from_domain", "?")),
+                  esc(ident.get("match", "?")), esc(tr.get("allow", "?")),
+                  kvdump(tr, "all parsed endpoint settings")))
+
+    prows = "".join(
+        '<div class="chk"><span class="pill p-info">link</span>'
+        '<span class="nm"><a href="%s" target="_blank" rel="noreferrer">%s</a></span>'
+        '%s</div>' % (esc(url), esc(nm),
+                      '<span class="dt">%s</span>' % esc(note) if note else "")
+        for nm, url, note in PORTAL_LINKS)
+    out.append('<div class="card"><h2>voip.ms portal</h2>'
+               '<div class="body flush">%s</div>'
+               '<div class="body tight"><p class="hint" style="margin:0">Portal menu '
+               'labels move around; these deep links are the stable part. The REST API '
+               'could automate some of this &mdash; deliberately not wired up, since it '
+               'would mean storing an API key that can spend money.</p></div>'
+               '</div>' % prows)
+
+    out.append('<div class="card"><h2>Adding a device</h2><div class="body">'
+               '<p>Six lines in <span class="mono">%s</span>, using the templates '
+               'already in the file:</p>'
+               '<pre class="cmd">[kitchen](endpoint-tpl)\nauth=kitchen\naors=kitchen\n'
+               'callerid=Kitchen &lt;104&gt;\n[kitchen](auth-tpl)\nusername=kitchen\n'
+               'password=PASTE_A_RANDOM_ONE\n[kitchen](aor-tpl)</pre>'
+               '<pre class="cmd">head -c 18 /dev/urandom | base64\n'
+               'sudo asterisk -rx "pjsip reload"</pre>'
+               '<p class="hint">Then add the extension to '
+               '<span class="mono">RINGALL</span> in extensions.conf if it should ring '
+               'on inbound calls.</p></div></div>' % esc(PJSIP_CONF))
+    return "".join(out)
+
+
+@app.get("/devices", response_class=HTMLResponse)
+def page_devices(request: Request, _=Depends(require_auth)):
+    return render("/devices", "orata - devices", devices_body(), flash_of(request))
 
 
 # =====================================================================

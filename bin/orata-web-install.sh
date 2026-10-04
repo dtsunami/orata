@@ -78,11 +78,19 @@ fi
 
 TOKEN="$(sed -n 's/^ORATA_WEB_TOKEN=//p' "$CONF" | head -1)"
 if [ -z "$TOKEN" ]; then
-    TOKEN="$(head -c 24 /dev/urandom | base64)"
+    # base64url alphabet. A literal '+' in a query string decodes to a SPACE,
+    # so a plain-base64 token makes the one-shot ?token= link fail with
+    # "orata: missing or bad token". '-' and '_' are query-safe.
+    TOKEN="$(head -c 24 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')"
     echo "==> generated admin token"
 else
     echo "==> keeping existing admin token"
 fi
+
+# Percent-encode for the printed URL so that a pre-existing token containing
+# '+' or '/' still yields a working link.
+URL_TOKEN="$(printf '%s' "$TOKEN" \
+    | sed -e 's/%/%25/g' -e 's/+/%2B/g' -e 's|/|%2F|g' -e 's/=/%3D/g')"
 
 # base64 never contains '|', so it is a safe sed delimiter here
 sed -i \
@@ -118,7 +126,7 @@ URL_HOST="$BIND"
 echo
 echo "orata-web is running."
 echo
-echo "  http://$URL_HOST:$PORT/?token=$TOKEN"
+echo "  http://$URL_HOST:$PORT/?token=$URL_TOKEN"
 echo
 echo "Open that once; the token moves into an HttpOnly cookie and the URL"
 echo "cleans itself. Token is stored in $CONF (mode 600)."

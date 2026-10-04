@@ -92,6 +92,19 @@ For tunnel-only access from a desktop:
 then browse `http://127.0.0.1:8088/?token=YOUR_TOKEN`. The token goes into an
 HttpOnly cookie; after that, plain `http://127.0.0.1:8088/`.
 
+### If the token link 401s
+
+`orata: missing or bad token` on the one-shot link almost always means the
+token contains a `+`. In a query string a literal `+` decodes to a **space**,
+so the value reaching `hmac.compare_digest` is not the value in `web.conf`.
+Percent-encode it as `%2B` (and `/` as `%2F`) to get in once, then rotate to a
+query-safe token:
+
+    head -c 24 /dev/urandom | base64 | tr '+/' '-_' | tr -d '='
+
+`bin/orata-web-install.sh` generates base64url and percent-encodes the printed
+URL, so this only bites tokens created by hand or by an older installer.
+
 ## What the UI deliberately will not do
 
 It never writes a config file. Every mutation goes through
@@ -110,6 +123,33 @@ So these stay hand-edited, and no amount of UI polish should absorb them:
 The Diagnostics tab *detects and reports* every one of these — stubbed
 credentials, missing ntfy URL, selftest context not loaded — and tells you
 which file to edit. Reporting is the boundary.
+
+## The Setup tab
+
+`/setup` is the first tab and the intended landing page after install. It is a
+six-step walkthrough that reads live state and marks each step done / do this
+now / waiting — exactly one step is ever "do this now". Reload after changing
+something and it re-evaluates.
+
+| Step | Detected by |
+|---|---|
+| 0. voip.ms portal | not detectable — always shown, it is the step that costs money if skipped |
+| 1. Credentials into pjsip.conf | the four stub strings are gone |
+| 2. Reload and register | `pjsip show registrations` says `Registered` |
+| 3. Register a softphone | `pjsip show contacts` has pc/mobile/desk |
+| 4. Load the name book | `cnam` book is non-empty |
+| 5. Announcements | ARC installed, or LWA credentials set, or mode `off` |
+
+It names the portal fields and which pjsip.conf keys they map to, since the
+POP hostname appears in four places and the sub-account username in three.
+Step 0 also covers the two portal settings that are easy to miss and produce
+confusing symptoms: **routing the DID to the sub-account** (a DID still
+pointed at the main account never reaches the Pi) and the **codec list**,
+which must include `ulaw` and `g722` to match pjsip.conf.
+
+Like every other page, it **edits nothing**. It tells you which file to open
+and what to put in it. The Books tab shows a banner linking here while the
+trunk is unregistered.
 
 ## What it manages
 
