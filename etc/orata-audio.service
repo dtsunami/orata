@@ -1,0 +1,28 @@
+# Host-specific owner/UID; runs in dfstar's EXISTING PipeWire user session.
+[Unit]
+Description=Orata fixed Alexa call prompt player (experimental)
+After=bluetooth.service user@1000.service
+Wants=bluetooth.service user@1000.service
+
+[Service]
+Type=simple
+User=dfstar
+Group=asterisk
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/bin/python3 /usr/local/bin/orata-audio-worker.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/orata-audio
+UMask=0007
+MemoryMax=96M
+
+[Install]
+WantedBy=multi-user.target

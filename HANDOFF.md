@@ -3,9 +3,12 @@
 Updated **2026-10-04**. This is the current handoff, not a fresh-install guide.
 
 **The phone works; the user reports that Alexa's smoke test worked.**
-The immediate next task is to retrieve/power the remaining Echos, verify
-coverage, and run the complete inbound-call acceptance matrix. No need to
-restart Amazon token setup or build the sensor/Lambda route for that.
+The user also confirmed that the saved `alexa_call_orata` command, played
+through the Pi's DCR010 Bluetooth speaker, causes Alexa to place a call.
+An experimental automatic callback bridge is now in source, disabled by
+default and not deployed or live-verified. See [callback prototype](docs/alexa-callback.md).
+Caller-ID spoofing and acoustic activation remain explicit limitations.
+Echo coverage and the complete inbound-call acceptance matrix remain open.
 
 ## Evidence and remaining uncertainty
 
