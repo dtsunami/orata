@@ -16,6 +16,10 @@ SENSOR="${3:-}"
 [ -r /etc/orata/announce.conf ] && . /etc/orata/announce.conf
 
 ARC="${ORATA_ARC:-/usr/local/bin/alexa_remote_control.sh}"
+AUDIO_DIR="${ORATA_AUDIO_DIR:-/var/lib/orata/announce}"
+AUDIO_KEEP="${ORATA_AUDIO_KEEP:-50}"
+RECORD_AUDIO="${ORATA_RECORD_AUDIO:-1}"
+TTS="${ORATA_TTS:-}"
 DEVICES="${ORATA_ALEXA_DEVICES:-ALL}"
 ALEXA_CMD="${ORATA_ALEXA_CMD:-announce}"
 NTFY_URL="${ORATA_NTFY_URL:-}"
@@ -37,6 +41,50 @@ elif [ "$SPEAK_DIGITS" = "1" ]; then
 else
     PHRASE="Call from an unknown number"
 fi
+
+# --- channel 0: local render -- hear it without an Echo ---------------
+# Writes a WAV the web UI can play back. Entirely local: no network, no
+# credentials, nothing to expire. Runs first so a recording exists even
+# if every remote channel hangs. Never fails the script.
+#
+# This proves what was SAID, not that Amazon spoke it. For that, read the
+# "alexa OK" line.
+announce_audio() {
+    [ "$RECORD_AUDIO" = "1" ] || return 0
+
+    local tts="$TTS"
+    if [ -z "$tts" ]; then
+        for c in espeak-ng espeak; do
+            if command -v "$c" >/dev/null 2>&1; then tts="$c"; break; fi
+        done
+    fi
+    if [ -z "$tts" ]; then
+        log "audio SKIP ${NUM} -- no espeak-ng/espeak on PATH"
+        return 0
+    fi
+
+    mkdir -p "$AUDIO_DIR" 2>/dev/null
+
+    # The web UI only serves names matching ^\d{8}-\d{6}-\d{3,15}\.wav$,
+    # so the number must be digits or the file is unreachable from there.
+    local safe
+    safe="$(printf '%s' "$NUM" | tr -cd '0-9')"
+    [ -n "$safe" ] || safe="000"
+
+    local f="${AUDIO_DIR}/$(date +%Y%m%d-%H%M%S)-${safe}.wav"
+    if timeout 10 "$tts" -w "$f" "$PHRASE" >/dev/null 2>&1 && [ -s "$f" ]; then
+        log "audio OK   ${NUM} ${f}"
+    else
+        rm -f "$f" 2>/dev/null
+        log "audio FAIL ${NUM} -- ${tts} could not write ${f}"
+    fi
+
+    # Ring buffer. Without this the SSD fills one call at a time.
+    ls -1t "$AUDIO_DIR"/*.wav 2>/dev/null | tail -n +$((AUDIO_KEEP + 1)) \
+        | while IFS= read -r old; do rm -f "$old"; done
+}
+
+announce_audio
 
 # --- channel 1: ntfy -- boring, reliable, never breaks ----------------
 if [ -n "$NTFY_URL" ]; then

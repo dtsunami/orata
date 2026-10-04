@@ -211,6 +211,69 @@ Look for the `blocked` label and the `STRICT` GotoIf. Block your own mobile
 and call in; you should get a decline, and `BLOCKED <num>` in the Asterisk
 console.
 
+## The Audio tab
+
+The problem this solves: until an Echo is authenticated, "did the
+announcement work?" has no answer you can observe from the Pi. The log says
+`alexa SKIP`, and that is all you get.
+
+So `orata-announce.sh` now renders the phrase locally as well. Before it
+touches ntfy or Amazon, it runs espeak into a WAV:
+
+    /var/lib/orata/announce/20260104-143052-15551234567.wav
+
+and logs `audio OK <path>`. The web UI serves those back — the **Audio** tab
+lists the most recent 50 newest-first with an inline player, the **Log** tab
+puts a `play` link on any line that produced one, and firing an announcement
+from the **Harness** tab shows a player in the result card.
+
+**What this does and does not prove.** It proves the dialplan invoked the
+script, the name book resolved, and the phrase came out right — "Call from
+Mom" and not "Call from an unknown number". It says nothing whatsoever about
+whether Amazon spoke it. Only `alexa OK` in the log proves that. The UI
+repeats this warning in three places because it is an easy and expensive
+thing to confuse.
+
+The practical use is debugging the *phrase*, which is where the mistakes
+actually are: a number in the book in the wrong format, `ORATA_SPEAK_DIGITS`
+not doing what you expected, a name with punctuation espeak mangles.
+
+### Config
+
+In `announce.conf` (the source of truth; `web.conf`'s
+`ORATA_WEB_AUDIO_DIR` only overrides where the UI looks):
+
+    ORATA_RECORD_AUDIO=1                      # 0 disables entirely
+    ORATA_AUDIO_DIR=/var/lib/orata/announce
+    ORATA_AUDIO_KEEP=50                       # ring buffer
+    ORATA_TTS=                                # blank = autodetect
+
+Needs `apt install espeak-ng`. Without it you get `audio SKIP` and an empty
+tab; nothing else changes.
+
+`ORATA_AUDIO_KEEP` is a hard ring buffer — the newest N survive, everything
+older is deleted on **every** call. At a few tens of KB per file, 50 is well
+under a megabyte. This matters: unbounded recordings are how you fill the
+SSD, which is the failure mode this project already designed around once.
+
+The default directory is inside `/var/lib/orata`, which is `700
+asterisk:asterisk` and already in the service unit's `ReadWritePaths`. If you
+move it, add the new path there or `ProtectSystem=strict` will make writes
+fail in a way that looks like a TTS problem.
+
+### Why this is safe to leave on
+
+No call audio is recorded, ever. These are synthesised renders of a phrase
+the Pi composed itself — the same text sent to Amazon. The only information
+in them is the caller's name and number, which is already in astdb and
+already in the log.
+
+Serving them is the one place the UI returns a file from disk, so the
+filename handling is deliberately rigid: names must match
+`^\d{8}-\d{6}-\d{3,15}\.wav$`, are basenamed before matching, and anything
+else is refused rather than sanitised. Nothing the user types is ever joined
+to a path.
+
 ## Known gaps
 
 - **No TLS.** SSH tunnel or WireGuard only.
@@ -220,7 +283,11 @@ console.
   Adequate for a single-user LAN tool, not for anything wider.
 - **No logrotate for `announce.log`.** Predates this change and still unfixed;
   the UI only reads the last 8 KB, so it will not choke, but the file grows
-  forever.
+  forever. Note the asymmetry: the WAVs *are* bounded (`ORATA_AUDIO_KEEP`),
+  the log they are indexed by is not.
+- **Audio playback is not proof of announcement.** The Audio tab tells you
+  what the Pi composed, not what an Echo said. Reading it as end-to-end
+  confirmation is the single most likely misuse of this UI.
 - **Number format is not normalised.** The UI strips non-digits, so
   `(555) 123-4567` becomes `5551234567` — which will **not** match what
   voip.ms presents (`15551234567`). Enter numbers exactly as they appear in

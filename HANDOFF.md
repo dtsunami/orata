@@ -1,11 +1,17 @@
 # HANDOFF
 
-Session 3. **Asterisk is built, installed, running, and the inbound call
-logic has been executed and verified on the Pi.** See "Session 3 results"
-below for what is now proven vs still untested.
+Session 5. **The phone works.** Calls complete in both directions between a
+real mobile over the PSTN and MicroSIP on the LAN, with audio. The trunk, the
+dialplan, RTP and codec negotiation are all proven by execution. See "Session
+5 results".
 
-Sessions 1-2 wrote this repo on a Windows box with nothing deployed. That is
-no longer the case.
+Sessions 1-2 wrote this repo on a Windows box with nothing deployed. Session 3
+built and installed Asterisk from source and verified the dialplan logic
+against synthetic channels. Session 4 moved root to a USB SSD. Session 5 made
+it a telephone.
+
+What remains is the *announcement* layer (the stated point of the project) and
+the operational work that makes the thing survive unattended.
 
 ---
 
@@ -249,27 +255,163 @@ These ran on the Pi against the real dialplan:
 - `orata-web.py` imports clean on Python 3.13 (uses none of the modules
   trixie removed: `cgi`, `crypt`, `telnetlib`)
 
-### Still untested — needs real SIP
+---
 
-- Registration to voip.ms (POP + credentials are still stubs; currently
-  `No response received from 'sip:newyork.voip.ms'`, which is expected)
-- RTP, audio, codec negotiation
-- Whether `Read()`'s 7s timeout feels right to a human caller
-- Anything Alexa (both paths need real credentials)
+## Session 5 results (on-Pi) — END-TO-END CALLS WORK
 
-## Next session: do these in order
+**Milestone: complete calls in both directions between a mobile phone on the
+PSTN and MicroSIP on the LAN.** Inbound DID -> voip.ms -> Pi -> softphone
+rings -> answered -> two-way audio. Outbound softphone -> Pi -> voip.ms ->
+mobile, same.
 
-1. **voip.ms portal first.** Spending cap, block international dialing, create
-   a sub-account for the trunk, enable IP whitelist. Before anything
-   registers. This is the only irreversible mistake available; compromised
-   PBXes get drained to premium-rate numbers overnight.
-2. Fill in POP + credentials in `/etc/asterisk/pjsip.conf`, `core reload`,
-   confirm `pjsip show registrations` shows `Registered`. (Asterisk itself is
-   already installed and running.)
-3. Get calls ringing on **one** softphone (MicroSIP on the PC). Ignore Alexa.
-4. Test the gate with a real unknown caller — the prompt and `Read()` are
-   deployed and playable, but the timeout is unvalidated against a human.
-5. Only then: `alexa_remote_control.sh -a`, then dial `*99`.
+This retires, by execution, every item that was on the "needs real SIP" list
+except the two noted below:
+
+- Registration to voip.ms — **Registered**. The POP and sub-account
+  credentials in `/etc/asterisk/pjsip.conf` are real now, not stubs. (The
+  repo copy of `pjsip.conf` still carries the `newyork.voip.ms` placeholder
+  by design — credentials never land in git. If the deployed POP differs,
+  that divergence is intentional and undocumented on purpose.)
+- RTP, audio, codec negotiation — working in both directions. No one-way
+  audio, so whatever `local_net` / NAT posture is deployed is correct for
+  this network. **Do not touch `external_media_address` /
+  `external_signaling_address` without a reason** — they are currently in a
+  known-good state.
+- Inbound DID routing through `[from-voipms]` to a live endpoint.
+- Outbound dialing through the trunk.
+- The no-port-forward invariant holds in practice: inbound calls arrive on
+  the outbound registration.
+
+### Still unverified after session 5
+
+- **Anything Alexa.** Neither path has real credentials. This is the whole
+  point of the project and it is the only feature still missing.
+- **The robocall gate against a human.** The logic is proven (session 3) and
+  the prompt plays, but no real unknown caller has sat through
+  `Read(digit,custom/press-one,1,,1,7)`. The 7s window is still a guess.
+- **Mobile client off-LAN.** MicroSIP is a desktop on the same network.
+  Groundwire + WireGuard is untested, and "home phone" is not really true
+  until the phone rings when you are not home.
+- **Reboot survival.** Unknown whether a cold boot comes back registered
+  without hand-holding — the `asterisk` unit's enable state and start
+  ordering have not been exercised since the source install.
+
+---
+
+## Strategy to finish — four phases, in order
+
+The project is past the risky part. What is left splits cleanly into
+"finish the feature", "make it survive", "insure the fragile bit", and
+"polish". Do not interleave them; each phase is testable on its own.
+
+### Phase 1 — Make it announce (the actual deliverable)
+
+Nothing else matters until an Echo says "Call from Mom". Everything built so
+far is scaffolding for this.
+
+0. **First, with no Amazon involvement at all:** `apt install espeak-ng`,
+   then fire an announcement from the web UI's Harness tab and play it back
+   on the **Audio** tab. This confirms the dialplan reaches the script, the
+   name book resolves, and the phrase is right ("Call from Mom", not "Call
+   from an unknown number") — all the failure modes that are *not* Amazon's
+   fault, separated out before you add one that is. Added session 5; see
+   `docs/web-ui.md`.
+1. `sudo -u asterisk /usr/local/bin/alexa_remote_control.sh -a` — browse to
+   `http://<pi-ip>:5601` from the LAN, log in. **Must be the `asterisk`
+   user** or the cookie lands in the wrong home directory.
+2. `sudo -u asterisk alexa_remote_control.sh -l` to get exact device names.
+3. `sudo -u asterisk alexa_remote_control.sh -d ALL -e "announce:test"`.
+   If only one device speaks, set `ORATA_ALEXA_CMD=speak` in
+   `announce.conf` — this is the top known-unknown in the repo.
+4. Dial `*99`.
+5. Put one real number in the name book and call from it. The success
+   criterion is a spoken name, not a chime.
+6. Check `/var/log/orata/announce.log` for `alexa FAIL`.
+
+Watch for the two time-wasters: Do Not Disturb silently suppresses
+announcements, and announcement volume follows device volume.
+
+### Phase 2 — Make it survive unattended
+
+A phone that needs a human is not a phone. These are the gaps the repo does
+*not* currently cover, roughly in order of what bites first:
+
+- **Reboot test.** `systemctl is-enabled asterisk`, then actually reboot and
+  confirm `pjsip show registrations` comes back `Registered` with no
+  intervention. Do this before trusting the line.
+- **Back up astdb.** The name book, whitelist, blocklist and sensor map all
+  live in Asterisk's sqlite astdb. It is now the only irreplaceable state on
+  the box and there is **no backup path in this repo**. A cron'd
+  `sqlite3 .backup` (or `database show` dumped to a text file, which is
+  restorable via `orata-cnam.sh`) to the SSD plus somewhere off-box. The
+  text dump is arguably better: human-readable, diffable, survives an
+  Asterisk major-version schema change.
+- **Log rotation.** `/var/log/orata/announce.log` grows without bound, and
+  CDR/full logging from a source build does not get Debian's packaged
+  logrotate config. Unbounded logs on the SSD are the slow-motion version of
+  the SD-card failure this project already designed around.
+- **Fail-loud.** Right now a dead Alexa cookie degrades to silence plus a
+  log line nobody reads. The ntfy push covers the call itself, but nothing
+  tells you the announce path rotted. Cheapest fix: a weekly cron that greps
+  the log for `alexa FAIL` and pushes to ntfy if found.
+- **Voicemail PIN.** Mailbox 100 is still `1357`. Outstanding since
+  session 3.
+- **Confirm the portal invariants actually got set** — spending cap,
+  international block, sub-account, IP whitelist. These were step 1 of the
+  session-4 plan; now that the trunk is live and registered they are load-
+  bearing, not theoretical.
+
+### Phase 3 — Insure the fragile bit (Alexa path B)
+
+Path A's cookie will die, historically about once a year, and it will die on
+a day you are not thinking about this project. Path B (`docs/alexa-sensor.md`)
+is already written; what is missing is the AWS side — Smart Home skill,
+Lambda, LWA credentials, one Routine per sensor.
+
+Do this **while path A still works**, because then the failover is
+`ORATA_ALEXA_MODE=sensor` and a reload. Do it after path A dies and it is an
+afternoon of AWS console archaeology under pressure.
+
+Verify with `ORATA_ALEXA_MODE=both` once (you hear every call twice), then
+set it back to `arc`.
+
+Start with the tiered sensor layout (`orata-family` / `orata-known` /
+`orata-unknown`) — three Routines built once, versus one per contact forever.
+ntfy still carries the exact name to your phone, so you lose less than it
+sounds.
+
+### Phase 4 — Reach and polish
+
+- **Groundwire + WireGuard** on the mobile. This is what turns the DID into
+  the household's actual number. Free SIP clients miss backgrounded calls;
+  this is the one paid thing.
+- Add the remaining endpoints from the `pjsip.conf` templates (six lines
+  each) and decide the real ring group.
+- Tune the gate's 7s `Read()` timeout once a real stranger has hit it.
+- **Asterisk CVE watch.** The source build is a standing obligation — see
+  `docs/build-from-source.md`. Subscribe to the AST-xxxx security advisories
+  and know the rebuild steps before you need them urgently. This is the debt
+  the project knowingly took on; the mitigation is a calendar reminder, not
+  code.
+- Still unresolved from session 3: the tarball signature was never verified
+  (keyserver unreachable, key URLs 404). Check the fingerprint and SHA256
+  from a machine with keyserver access.
+
+### Explicitly out of scope unless asked
+
+SMS/MMS, a dedicated `orata` unix user, call recording, and any reopening of
+the Docker/k8s/FreePBX/HA questions. The rejection table at the top stands.
+
+### Definition of done
+
+The project is finished when: a call from a known number speaks their name on
+the Echos; a call from an unknown number is gated and never reaches them; the
+Pi survives a power cut and comes back registered on its own; the name book
+is backed up somewhere other than the Pi; and the Alexa failover is a config
+change rather than a project.
+
+Phases 1 and 2 get you a phone you can rely on. Phase 3 is what keeps it
+reliable a year from now.
 
 ### Do these too (found in session 3)
 

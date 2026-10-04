@@ -27,6 +27,7 @@ import html
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -66,6 +67,12 @@ ANNOUNCE_CONF = CFG.get("ORATA_ANNOUNCE_CONF", "/etc/orata/announce.conf")
 PJSIP_CONF = CFG.get("ORATA_PJSIP_CONF", "/etc/asterisk/pjsip.conf")
 PROBE_NUM = CFG.get("ORATA_WEB_PROBE_NUMBER", "19999999999")
 AST_LOG = CFG.get("ORATA_ASTERISK_LOG", "/var/log/asterisk/orata.log")
+
+# Where orata-announce.sh drops its local WAV renders. announce.conf is
+# the source of truth; web.conf only overrides it. One key, one meaning.
+AUDIO_DIR = (CFG.get("ORATA_WEB_AUDIO_DIR")
+             or load_conf(ANNOUNCE_CONF).get("ORATA_AUDIO_DIR")
+             or "/var/lib/orata/announce")
 
 esc = html.escape
 
@@ -407,7 +414,8 @@ orata <span class="tag">{{HOST}}</span></span>
 """
 
 TABS = [("/setup", "Setup"), ("/devices", "Devices"), ("/", "Books"),
-        ("/diag", "Diagnostics"), ("/harness", "Harness"), ("/log", "Log")]
+        ("/diag", "Diagnostics"), ("/harness", "Harness"),
+        ("/audio", "Audio"), ("/log", "Log")]
 
 
 def render(active, title, body, flash=""):
@@ -746,6 +754,19 @@ def diag_announce():
     out.append(chk("pass", "ntfy fallback", "configured") if acfg.get("ORATA_NTFY_URL")
                else chk("warn", "ntfy fallback", "ORATA_NTFY_URL is empty",
                         "This is the channel that still works when Alexa auth rots."))
+    if acfg.get("ORATA_RECORD_AUDIO", "1") == "1":
+        tts = acfg.get("ORATA_TTS") or next(
+            (c for c in ("espeak-ng", "espeak") if shutil.which(c)), "")
+        out.append(chk("pass", "local audio render", "%s -> %s" % (tts, AUDIO_DIR))
+                   if tts else
+                   chk("warn", "local audio render", "no espeak-ng/espeak on PATH",
+                       "Announcements log 'audio SKIP' and the Audio tab stays empty. "
+                       "apt install espeak-ng"))
+        n = len(audio_files(500))
+        out.append(chk("pass" if n else "info", "recordings", "%d in %s" % (n, AUDIO_DIR),
+                       "" if n else "Fire one from the Harness tab."))
+    else:
+        out.append(chk("info", "local audio render", "ORATA_RECORD_AUDIO=0"))
     size = log_size()
     if size < 0:
         out.append(chk("warn", "announce.log", "missing: " + LOG,
@@ -1134,8 +1155,17 @@ def act_announce(number: str = Form(...), name: str = Form(""), _=Depends(requir
         rows.append((s, "log", line))
     if out:
         rows.append(("info", "stdout/stderr", out[:300]))
+    extra = ""
+    for line in new:
+        nm = audio_name_in(line)
+        if nm:
+            extra = ('<div class="body"><p class="hint" style="margin-top:0">'
+                     "Local render of the phrase &mdash; what the Echo was asked to "
+                     "say, not proof it said it. See the "
+                     '<span class="mono">alexa OK</span> line above for that.</p>'
+                     "%s</div>" % audio_player(nm))
     return render("/harness", "orata - harness",
-                  harness_body("", result_card("Announcement for %s" % num, rows)))
+                  harness_body("", result_card("Announcement for %s" % num, rows, extra)))
 
 
 @app.post("/harness/selftest", response_class=HTMLResponse)
@@ -1717,6 +1747,107 @@ def page_devices(request: Request, _=Depends(require_auth)):
 
 
 # =====================================================================
+# announcement audio
+#
+# orata-announce.sh renders every phrase to a WAV under AUDIO_DIR. This
+# serves them back so you can hear what was announced without standing
+# next to an Echo. Playback here is NOT evidence Amazon spoke anything --
+# only the "alexa OK" log line is that.
+# =====================================================================
+
+# The sole trusted shape. Anything else is refused rather than sanitised.
+AUDIO_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9]{3,15}\.wav$")
+
+
+def audio_name_in(line):
+    """Pull a servable recording name out of an 'audio OK <path>' log line."""
+    m = re.search(r"audio OK\s+(\S+\.wav)", line)
+    if not m:
+        return ""
+    name = os.path.basename(m.group(1))
+    return name if AUDIO_RE.match(name) else ""
+
+
+def audio_files(limit=50):
+    """(name, mtime, size), newest first. Names are filtered, never joined
+    with anything the user typed."""
+    try:
+        names = [n for n in os.listdir(AUDIO_DIR) if AUDIO_RE.match(n)]
+    except OSError:
+        return []
+    rows = []
+    for n in names:
+        try:
+            st = os.stat(os.path.join(AUDIO_DIR, n))
+        except OSError:
+            continue
+        rows.append((n, st.st_mtime, st.st_size))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return rows[:limit]
+
+
+def audio_player(name):
+    return ('<audio controls preload="none" style="height:2rem;vertical-align:middle" '
+            'src="/audio/file?f=%s"></audio>' % urllib.parse.quote(name))
+
+
+@app.get("/audio/file")
+def audio_file(f: str = "", _=Depends(require_auth)):
+    name = os.path.basename(f or "")
+    if not AUDIO_RE.match(name):
+        raise HTTPException(status_code=400, detail="bad recording name")
+    try:
+        with open(os.path.join(AUDIO_DIR, name), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        raise HTTPException(status_code=404, detail="no such recording")
+    return Response(data, media_type="audio/wav",
+                    headers={"Cache-Control": "private, max-age=3600",
+                             "Content-Disposition": 'inline; filename="%s"' % name,
+                             "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/audio", response_class=HTMLResponse)
+def page_audio(request: Request, _=Depends(require_auth)):
+    rows = audio_files(50)
+    body = ["<h1>Announcement audio</h1>",
+            '<p class="lede">Every announcement is also rendered to a WAV on the Pi, '
+            "newest first. This is how you check what was said without an Echo in "
+            "earshot &mdash; but it is a <b>local render of the phrase</b>, not proof "
+            'Amazon spoke it. For that, read the <span class="mono">alexa OK</span> '
+            'line on the <a href="/log">Log</a> tab.</p>']
+    if not rows:
+        body.append('<div class="card"><h2>Recordings</h2><div class="body">'
+                    '<div class="empty">nothing in %s yet</div>'
+                    '<p class="hint">Needs <span class="mono">ORATA_RECORD_AUDIO=1</span> '
+                    "in announce.conf and "
+                    '<span class="mono">apt install espeak-ng</span>. Then fire one from '
+                    'the <a href="/harness">Harness</a> tab, or take a call.</p>'
+                    "</div></div>" % esc(AUDIO_DIR))
+    else:
+        cells = []
+        for name, mtime, size in rows:
+            stem = name[:-4]
+            d, t, num = stem.split("-", 2)
+            when = "%s-%s-%s %s:%s:%s" % (d[0:4], d[4:6], d[6:8],
+                                          t[0:2], t[2:4], t[4:6])
+            cells.append(
+                '<div class="chk s-pass"><span class="nm mono">%s</span>'
+                '<span class="dt">%s &middot; %s &middot; %d bytes</span>'
+                '<span class="hn">%s</span></div>'
+                % (esc(num), esc(when), esc(name), size, audio_player(name)))
+        body.append('<div class="card"><h2>Recordings'
+                    '<span class="note">newest %d &middot; ring buffer</span></h2>'
+                    '<div class="body flush">%s</div></div>'
+                    % (len(rows), "".join(cells)))
+        body.append('<p class="hint">Older files are deleted automatically by '
+                    '<span class="mono">orata-announce.sh</span> &mdash; see '
+                    '<span class="mono">ORATA_AUDIO_KEEP</span>. Nothing here is '
+                    "call audio; no conversation is ever recorded.</p>")
+    return render("/audio", "orata - audio", "".join(body), flash_of(request))
+
+
+# =====================================================================
 # log
 # =====================================================================
 
@@ -1728,8 +1859,12 @@ def page_log(request: Request, _=Depends(require_auth)):
         for line in lines:
             cls = "lf" if "FAIL" in line else ("lo" if " OK " in line
                                                else ("ls" if "SKIP" in line else ""))
-            out.append('<span class="%s">%s</span>' % (cls, esc(line)) if cls
-                       else esc(line))
+            txt = '<span class="%s">%s</span>' % (cls, esc(line)) if cls else esc(line)
+            nm = audio_name_in(line)
+            if nm:
+                txt += ('   <a href="/audio/file?f=%s">play</a>'
+                        % urllib.parse.quote(nm))
+            out.append(txt)
         pre = "<pre>%s</pre>" % "\n".join(out)
     else:
         pre = '<div class="empty">empty or unreadable: %s</div>' % esc(LOG)

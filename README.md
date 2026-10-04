@@ -116,9 +116,20 @@ maintenance burden.
 ## Web UI
 
 Optional. A FastAPI app (`orata_web.py`) that edits the name book, whitelist,
-blocklist and Alexa sensor map from a browser, and carries a diagnostics page
-and a test harness. It shells out to `orata-cnam.sh`, so the CLI stays
-authoritative and nothing is generated or overwritten.
+blocklist and Alexa sensor map from a browser, and carries a diagnostics page,
+a test harness and an audio tab. It shells out to `orata-cnam.sh`, so the CLI
+stays authoritative and nothing is generated or overwritten.
+
+The **Audio** tab plays back announcements. `orata-announce.sh` renders every
+phrase to a WAV on the Pi (`apt install espeak-ng`) before it calls out, so
+you can hear what was announced without an Echo in earshot. Useful well before
+Alexa is set up at all — it is how you confirm the name book resolved and the
+phrase came out right.
+
+It proves the phrase, **not** the announcement. Only `alexa OK` in
+`announce.log` proves Amazon spoke anything. No call audio is ever recorded;
+these are synthesised renders of text the Pi composed, kept in a ring buffer
+(`ORATA_AUDIO_KEEP`, default 50).
 
 This is the one place the project takes a framework dependency. It is
 installed from Debian packages, not pip — trixie's python3 is
