@@ -18,6 +18,7 @@ SENSOR="${3:-}"
 ARC="${ORATA_ARC:-/usr/local/bin/alexa_remote_control.sh}"
 AUDIO_DIR="${ORATA_AUDIO_DIR:-/var/lib/orata/announce}"
 AUDIO_KEEP="${ORATA_AUDIO_KEEP:-50}"
+CLIP_DIR="${ORATA_CLIP_DIR:-/var/lib/orata/clips}"
 RECORD_AUDIO="${ORATA_RECORD_AUDIO:-1}"
 TTS="${ORATA_TTS:-}"
 DEVICES="${ORATA_ALEXA_DEVICES:-ALL}"
@@ -72,11 +73,45 @@ announce_audio() {
     [ -n "$safe" ] || safe="000"
 
     local f="${AUDIO_DIR}/$(date +%Y%m%d-%H%M%S)-${safe}.wav"
-    if timeout 10 "$tts" -w "$f" "$PHRASE" >/dev/null 2>&1 && [ -s "$f" ]; then
-        log "audio OK   ${NUM} ${f}"
-    else
-        rm -f "$f" 2>/dev/null
-        log "audio FAIL ${NUM} -- ${tts} could not write ${f}"
+    local nameclip="${CLIP_DIR}/name-${safe}.wav"
+    local prefix="${CLIP_DIR}/role-call-from.wav"
+    local made=0
+
+    # Personalised render: the "Call from" lead-in plus the name in a real
+    # voice. Requires NAME to be set too, so the local render and the Alexa
+    # phrase never disagree about who is calling.
+    #
+    # NOTE this affects the local WAV and the handset broadcast ONLY.
+    # Alexa is a text API -- it still speaks the espeak phrase. There is
+    # no way to hand Amazon an audio file for an announcement.
+    if [ -n "$NAME" ] && [ -s "$nameclip" ] && command -v sox >/dev/null 2>&1; then
+        # Synthesise the lead-in once and cache it. 8 kHz mono to match
+        # what Asterisk's Record() produces, or sox refuses to concatenate.
+        if [ ! -s "$prefix" ]; then
+            if timeout 10 "$tts" -w "${prefix}.raw" "Call from" >/dev/null 2>&1 \
+               && sox "${prefix}.raw" -r 8000 -c 1 -b 16 "${prefix}.new" \
+                    >/dev/null 2>&1; then
+                mv -f "${prefix}.new" "$prefix"
+            fi
+            rm -f "${prefix}.raw" "${prefix}.new" 2>/dev/null
+        fi
+        if [ -s "$prefix" ] \
+           && sox "$prefix" "$nameclip" "$f" >/dev/null 2>&1 && [ -s "$f" ]; then
+            log "audio OK   ${NUM} ${f} -- recorded name"
+            made=1
+        else
+            rm -f "$f" 2>/dev/null
+            log "audio WARN ${NUM} -- name clip unusable, falling back to ${tts}"
+        fi
+    fi
+
+    if [ "$made" = "0" ]; then
+        if timeout 10 "$tts" -w "$f" "$PHRASE" >/dev/null 2>&1 && [ -s "$f" ]; then
+            log "audio OK   ${NUM} ${f}"
+        else
+            rm -f "$f" 2>/dev/null
+            log "audio FAIL ${NUM} -- ${tts} could not write ${f}"
+        fi
     fi
 
     # Ring buffer. Without this the SSD fills one call at a time.

@@ -14,6 +14,10 @@ usage:
   orata-cnam.sh del <number>          remove a spoken name
   orata-cnam.sh list                  show the name book
 
+  orata-cnam.sh owner-list            numbers allowed to use 3434
+  orata-cnam.sh owner-add <number>    permit announce mode from this number
+  orata-cnam.sh owner-del <number>    revoke it
+
   orata-cnam.sh allow-list            show robocall-gate whitelist
   orata-cnam.sh allow-add <number>    whitelist a number
   orata-cnam.sh allow-del <number>    revoke (they'll get the gate again)
@@ -44,6 +48,14 @@ case "${1:-}" in
         $AST "database del cnam $2" ;;
     list)
         $AST "database show cnam" ;;
+    owner-list)
+        $AST "database show owner" ;;
+    owner-add)
+        [ $# -ge 2 ] || usage
+        $AST "database put owner $2 1" ;;
+    owner-del)
+        [ $# -ge 2 ] || usage
+        $AST "database del owner $2" ;;
     allow-list)
         $AST "database show allow" ;;
     allow-add)

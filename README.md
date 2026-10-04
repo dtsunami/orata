@@ -194,6 +194,168 @@ without the extension):
 
     sudo asterisk -rx "file convert /usr/share/asterisk/sounds/en/custom/press-one.gsm /tmp/verify.wav"
 
+## Recorded clips — your own voice
+
+espeak's announcement is a robot. To use your own voice instead, dial
+**`*96`** from any registered handset:
+
+    speak, then press #
+      1  replay
+      2  save
+      3  re-record
+      *  cancel
+
+Nothing enters the library until you press 2, so re-record as often as you
+like. Saved clips appear on the web UI's **Audio** tab, where you can label
+them, play them back, push one out to the handsets, or install one as the
+robocall gate prompt in place of the generated `press-one`.
+
+    orata-clip.sh list
+    orata-clip.sh label 20260104-143052 "gate prompt, take 3"
+    orata-clip.sh assign press-one 20260104-143052
+    orata-clip.sh unassign press-one        # back to the generated one
+    orata-clip.sh broadcast 20260104-143052
+
+`broadcast` originates a call to each endpoint in `ORATA_PAGE_ENDPOINTS` and
+plays the clip when answered — the phones **ring**. True auto-answer paging
+needs per-model `Alert-Info` headers and is deliberately not attempted.
+
+`*96` lives in `[internal]`, so it is reachable only from your own
+registered devices, never from the PSTN.
+
+## Announce mode — `3434` from your own phone
+
+Call the house from your mobile and speak an announcement into every
+handset, live. The flow:
+
+1. Call the DID from a number you have marked as an owner.
+2. You hear the gate prompt: *"Press 1 to continue."*
+3. Press **`3434`** instead.
+4. Beep. Speak. Press **`#`**.
+5. The clip is logged to the library, broadcast to the handsets, and you
+   hear the beep again — ready for the next one.
+6. Hang up to leave. A recording cut short by hanging up is still saved.
+
+Authorise your mobile first, or `3434` is rejected like any wrong entry:
+
+    orata-cnam.sh owner-add 15551234567
+    orata-cnam.sh owner-list
+    orata-cnam.sh owner-del 15551234567
+
+**The code alone is not authorisation.** The dialplan checks `owner/<num>`
+in astdb as well, so a robocaller that happens to send `3434` cannot record
+into your house. Caller ID is spoofable, which makes this a deterrent rather
+than real security — do not treat announce mode as locked.
+
+Owner numbers always hear the gate prompt even though they are in the name
+book, because that prompt is the only way in. Everyone else still skips it
+as before.
+
+Pressing `1` at the gate remains a single keypress, so normal callers are
+unaffected: the first digit decides the branch, and only a leading `3` makes
+Asterisk wait for the remaining `434`.
+
+### Recording mid-call — `3434`
+
+Press **`3434`** during any live call to capture what you say straight into
+the clip library. Beep, speak, `#` to stop, beep. The clip appears on the
+Audio tab immediately.
+
+This is the quickest way to get someone's name in their own voice: ask them
+to say it, press `3434`, done — no second call, no `*96`.
+
+The other party hears silence while you are recording. That is unavoidable —
+a channel cannot stay bridged and run `Record()` at the same time — so the
+caps are deliberately tight: `#`, or 2s of silence, or 30s. There is no
+review menu for the same reason; delete it from the UI if it came out wrong.
+
+Needs `features.conf` installed and `DYNAMIC_FEATURES` set on the channel.
+Both ship here: the feature is armed on inbound calls and on outbound NANP
+dialling.
+
+    sudo cp asterisk/features.conf /etc/asterisk/
+    sudo asterisk -rx "module reload features"
+
+(`features reload` is not a command on Asterisk 22 — it was removed. Use
+`module reload features`, or `core reload` if you are reloading everything.)
+
+Change the code by editing the `recordclip` line in `features.conf`.
+
+### Recorded caller names
+
+espeak mispronounces most names. To fix that per caller, use the **Recorded
+caller names** section of the Audio tab: every entry in the name book gets a
+row where you can type a phonetic spelling and synthesise it, or assign a
+recording of the person actually saying their name.
+
+    orata-clip.sh name-say 15551234567 "Yoshita"
+    orata-clip.sh name-set 15551234567 20260104-143052
+    orata-clip.sh name-list
+    orata-clip.sh name-del 15551234567
+
+The announcement then becomes a `sox` splice of a cached "Call from" lead-in
+and the name clip, instead of one espeak render.
+
+**This does not change what Alexa says.** Amazon's announcement API takes
+text, not audio — there is no way to hand it a WAV. Recorded names affect
+the local render on the Audio tab and "play on handsets" only. If an Echo is
+your primary announcement channel, a phonetic respelling in the *name book*
+is what you want, since that is the text Alexa receives.
+
+The name book in astdb remains the source of truth for identity and gate
+behaviour. A caller with no recording falls back to espeak, so the two can
+never disagree about who is calling.
+
+### Editing the prompts
+
+Every spoken prompt is editable from the **Audio** tab — type the words,
+press **synthesise**, and it applies to the next call. No file copying, no
+reload. Or assign a `*96` recording to use your own voice instead.
+
+| Role | Heard when |
+|---|---|
+| `press-one` | an unknown caller reaches the robocall gate |
+| `rec-start` | `*96`, before recording begins |
+| `rec-menu` | `*96`, the replay / save / re-record menu |
+| `rec-saved` | `*96`, after a clip is saved |
+
+    orata-clip.sh say press-one "Press 1 to continue."
+    orata-clip.sh roles                     # what is overridden
+    orata-clip.sh unassign press-one        # back to the built-in
+
+Overrides live in `/var/lib/orata/clips/role-*.wav`. The dialplan checks for
+one and falls back to the `custom/` sound file, so an unset prompt is always
+safe — the UI can never leave a caller in silence.
+
+Needs `apt install espeak-ng sox`. **sox is not optional**: espeak emits
+22050 Hz and Asterisk wants 8 kHz, so without it the audio plays at the
+wrong pitch.
+
+The UI deliberately writes only to `/var/lib/orata/clips`, never to the
+Asterisk sounds tree — that is root-owned and outside the service unit's
+`ReadWritePaths`.
+
+### Built-in prompt files (optional)
+
+The overrides above make these unnecessary, but if you want working prompts
+before touching the UI:
+
+    for p in \
+      "press-one:Press 1 to continue." \
+      "rec-start:Speak after the beep, then press hash." \
+      "rec-menu:Press 1 to replay, 2 to save, 3 to re-record, or star to cancel." \
+      "rec-saved:Saved."
+    do
+      n=${p%%:*}; t=${p#*:}
+      espeak -w /tmp/$n.wav "$t"
+      sudo sox /tmp/$n.wav -r 8000 -c 1 -t gsm \
+        /var/lib/asterisk/sounds/en/custom/$n.gsm
+    done
+
+Note the path: a **source build uses `/var/lib/asterisk/sounds/`**, not
+`/usr/share/asterisk/sounds/`. Diagnostics reports any prompt that has
+neither a sound file nor an override.
+
 ## Endpoints
 
 | Device | Client |

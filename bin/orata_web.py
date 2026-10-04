@@ -68,11 +68,14 @@ PJSIP_CONF = CFG.get("ORATA_PJSIP_CONF", "/etc/asterisk/pjsip.conf")
 PROBE_NUM = CFG.get("ORATA_WEB_PROBE_NUMBER", "19999999999")
 AST_LOG = CFG.get("ORATA_ASTERISK_LOG", "/var/log/asterisk/orata.log")
 
-# Where orata-announce.sh drops its local WAV renders. announce.conf is
-# the source of truth; web.conf only overrides it. One key, one meaning.
-AUDIO_DIR = (CFG.get("ORATA_WEB_AUDIO_DIR")
-             or load_conf(ANNOUNCE_CONF).get("ORATA_AUDIO_DIR")
+# announce.conf is the source of truth for both audio directories;
+# web.conf only overrides where the UI looks. One key, one meaning.
+ACFG = load_conf(ANNOUNCE_CONF)
+AUDIO_DIR = (CFG.get("ORATA_WEB_AUDIO_DIR") or ACFG.get("ORATA_AUDIO_DIR")
              or "/var/lib/orata/announce")
+CLIP_DIR = (CFG.get("ORATA_WEB_CLIP_DIR") or ACFG.get("ORATA_CLIP_DIR")
+            or "/var/lib/orata/clips")
+CLIP_SH = CFG.get("ORATA_CLIP_SH", "/usr/local/bin/orata-clip.sh")
 
 esc = html.escape
 
@@ -791,6 +794,29 @@ def diag_media():
     out.append(chk("pass", "vm-goodbye prompt", vg) if vg else
                chk("fail", "vm-goodbye prompt", "not found",
                    "Rejected callers hear nothing."))
+    # A role file assigned from the web UI satisfies the dialplan on its
+    # own; only prompts with neither a role nor a sound file are missing.
+    missing = [p for p in ("rec-start", "rec-menu", "rec-saved")
+               if not _sound("custom/" + p) and not role_installed(p)]
+    out.append(chk("pass", "*96 prompts", "rec-start, rec-menu, rec-saved resolvable")
+               if not missing else
+               chk("warn", "*96 prompts", "no sound file and no override: "
+                   + ", ".join(missing),
+                   "Dialling *96 gives silence at those steps. Set them on the Audio "
+                   "tab, or install the sound files -- see README."))
+    if not shutil.which("sox"):
+        out.append(chk("warn", "sox", "not on PATH",
+                       "The Audio tab's 'synthesise' button needs it to resample "
+                       "espeak's 22 kHz output to 8 kHz. apt install sox"))
+    ok, fm = ast("features show")
+    out.append(chk("pass", "3434 in-call record", "recordclip is armed")
+               if ok and "recordclip" in fm else
+               chk("warn", "3434 in-call record", "recordclip not in the feature map",
+                   "Pressing 3434 mid-call does nothing. cp asterisk/features.conf "
+                   "to /etc/asterisk/ and run: asterisk -rx 'module reload features'"))
+    nrec = len([n for n in (os.listdir(CLIP_DIR) if os.path.isdir(CLIP_DIR) else [])
+                if n.startswith("name-") and n.endswith(".wav")])
+    out.append(chk("info", "recorded caller names", "%d" % nrec))
     ok, vm = ast("voicemail show users")
     out.append(chk("pass", "Mailbox 100", "exists")
                if ok and re.search(r"^\s*\S+\s+100\b", vm, re.M) else
@@ -1844,7 +1870,361 @@ def page_audio(request: Request, _=Depends(require_auth)):
                     '<span class="mono">orata-announce.sh</span> &mdash; see '
                     '<span class="mono">ORATA_AUDIO_KEEP</span>. Nothing here is '
                     "call audio; no conversation is ever recorded.</p>")
+    body.append(prompts_card())
+    body.append(names_card())
+    body.append(clips_card())
     return render("/audio", "orata - audio", "".join(body), flash_of(request))
+
+
+# ---------------------------------------------------------------------
+# recorded clips -- your own voice, captured by dialling *96
+#
+# Same rigidity as the renders above: names are timestamps, validated by
+# regex, never built from anything typed. Mutations shell out to
+# orata-clip.sh so the CLI stays the write path.
+# ---------------------------------------------------------------------
+
+CLIP_RE = re.compile(r"^[0-9]{8}-[0-9]{6}\.wav$")
+CLIP_SERVE_RE = re.compile(
+    r"^(?:[0-9]{8}-[0-9]{6}|role-[a-z0-9-]{1,24}|name-[0-9]{3,15})\.wav$")
+
+# (role, title, what it is, suggested text). Order is the order callers
+# hear them. Keep in step with VALID_ROLES in orata-clip.sh.
+CLIP_ROLES = [
+    ("press-one", "Robocall gate", "Unknown callers hear this before pressing 1.",
+     "Press 1 to continue."),
+    ("rec-start", "*96 record", "Played before recording starts.",
+     "Speak after the beep, then press hash."),
+    ("rec-menu", "*96 review menu", "The replay / save / re-record menu.",
+     "Press 1 to replay, 2 to save, 3 to re-record, or star to cancel."),
+    ("rec-saved", "*96 saved", "Confirmation after a clip is saved.",
+     "Saved."),
+]
+
+
+def clip_label(stem):
+    try:
+        with open(os.path.join(CLIP_DIR, stem + ".txt")) as fh:
+            return fh.read().strip()[:120]
+    except OSError:
+        return ""
+
+
+def role_source(role):
+    try:
+        with open(os.path.join(CLIP_DIR, "role-%s.txt" % role)) as fh:
+            return fh.read().strip()[:40]
+    except OSError:
+        return ""
+
+
+def role_installed(role):
+    return os.path.exists(os.path.join(CLIP_DIR, "role-%s.wav" % role))
+
+
+def clip_files(limit=100):
+    try:
+        names = [n for n in os.listdir(CLIP_DIR) if CLIP_RE.match(n)]
+    except OSError:
+        return []
+    rows = []
+    for n in names:
+        try:
+            st = os.stat(os.path.join(CLIP_DIR, n))
+        except OSError:
+            continue
+        rows.append((n[:-4], st.st_mtime, st.st_size))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return rows[:limit]
+
+
+def clip_player(name):
+    return ('<audio controls preload="none" style="height:2rem;vertical-align:middle" '
+            'src="/clips/file?f=%s"></audio>' % urllib.parse.quote(name))
+
+
+def clip_secs(size):
+    """8 kHz 16-bit mono PCM, minus a 44-byte header. Approximate on purpose."""
+    return max(0.0, (size - 44) / 16000.0)
+
+
+def prompts_card():
+    """Every spoken prompt, editable as text or replaceable by a recording.
+
+    Writes land in CLIP_DIR, never in the Asterisk sounds tree -- that is
+    root-owned and outside the service unit's ReadWritePaths, so the UI
+    could not write there even if it wanted to. The dialplan checks for a
+    role file and falls back to the shipped sound, which means an empty
+    role is always safe."""
+    rows = clip_files(100)
+    out = ['<div class="card"><h2>Spoken prompts'
+           '<span class="note">applies to the next call</span></h2>'
+           '<div class="body">',
+           '<p class="hint" style="margin-top:0">Type the words and press '
+           '<b>synthesise</b> for a robot voice, or record one by dialling '
+           '<span class="mono">*96</span> and assign it below. Unset prompts fall '
+           "back to the sound files installed with the project, so clearing one can "
+           "never leave a caller in silence.</p>"]
+    for role, title, blurb, suggested in CLIP_ROLES:
+        inst = role_installed(role)
+        src = role_source(role) if inst else ""
+        # Prefill with the current text if it was synthesised, so editing
+        # a prompt is a tweak rather than a retype.
+        cur = src[6:] if src.startswith("text: ") else ""
+        pick = "".join(
+            '<option value="%s">%s%s</option>'
+            % (esc(stem), esc(stem),
+               " -- " + esc(clip_label(stem)) if clip_label(stem) else "")
+            for stem, _m, _s in rows)
+        out.append(
+            '<div style="border-top:1px solid #222;padding:.75rem 0">'
+            '<div class="row" style="align-items:center">'
+            '<b>%s</b>%s<span class="hint" style="margin:0;flex:1;min-width:12rem">%s</span>'
+            "</div>"
+            '<div class="row" style="margin-top:.45rem">'
+            '<form class="row" method="post" action="/clips/say" style="margin:0">'
+            '<input type="hidden" name="role" value="%s">'
+            '<input class="in" name="text" value="%s" placeholder="%s" size="34">'
+            '<button class="btn primary" type="submit">synthesise</button></form>'
+            "%s%s</div></div>"
+            % (esc(title),
+               ("  " + clip_player("role-%s.wav" % role)) if inst else "",
+               esc(src if inst else blurb),
+               esc(role), esc(cur, quote=True), esc(suggested, quote=True),
+               # assign-from-recording, only offered when clips exist
+               ('<form class="row" method="post" action="/clips/assign" '
+                'style="margin:0"><input type="hidden" name="role" value="%s">'
+                '<select class="in" name="name">%s</select>'
+                '<button class="btn" type="submit">use recording</button></form>'
+                % (esc(role), pick)) if rows else "",
+               ('<form class="inline" method="post" action="/clips/unassign">'
+                '<input type="hidden" name="role" value="%s">'
+                '<button class="btn" type="submit">reset</button></form>'
+                % esc(role)) if inst else ""))
+    out.append("</div></div>")
+    return "".join(out)
+
+
+def name_source(num):
+    try:
+        with open(os.path.join(CLIP_DIR, "name-%s.txt" % num)) as fh:
+            return fh.read().strip()[:200]
+    except OSError:
+        return ""
+
+
+def name_recorded(num):
+    return os.path.exists(os.path.join(CLIP_DIR, "name-%s.wav" % num))
+
+
+def names_card():
+    """Per-caller spoken names, in a real voice.
+
+    The name book (astdb) stays the source of truth for WHO is calling and
+    whether the gate is skipped; this only changes how the name SOUNDS in
+    the local render. A caller with no recording here falls back to espeak,
+    so the two can never disagree about identity."""
+    book = db_show("cnam")
+    clips = clip_files(100)
+    out = ['<div class="card"><h2>Recorded caller names'
+           '<span class="note">local audio only</span></h2><div class="body">',
+           '<p class="hint" style="margin-top:0">Say the name yourself instead of '
+           'letting espeak mangle it &mdash; &ldquo;Call from <i>Yoshita</i>&rdquo; '
+           "pronounced properly. Applies to the WAV on this page and to "
+           "&ldquo;play on handsets&rdquo;.</p>"
+           '<p class="hint"><b>It does not change what Alexa says.</b> Amazon\'s '
+           "announcement API takes text, not audio, so an Echo still speaks the "
+           "espeak phrase. This is for the local render and the handsets.</p>"]
+    if not book:
+        out.append('<div class="empty">the name book is empty &mdash; '
+                   'add someone on the <a href="/">Books</a> tab first</div>')
+    for num, name in book:
+        rec = name_recorded(num)
+        src = name_source(num)
+        cur = src[6:] if src.startswith("text: ") else ""
+        pick = "".join(
+            '<option value="%s">%s%s</option>'
+            % (esc(stem), esc(stem),
+               " -- " + esc(clip_label(stem)) if clip_label(stem) else "")
+            for stem, _m, _s in clips)
+        out.append(
+            '<div style="border-top:1px solid #222;padding:.75rem 0">'
+            '<div class="row" style="align-items:center">'
+            '<span class="mono">%s</span><b>%s</b>%s'
+            '<span class="hint" style="margin:0;flex:1;min-width:10rem">%s</span></div>'
+            '<div class="row" style="margin-top:.45rem">'
+            '<form class="row" method="post" action="/names/say" style="margin:0">'
+            '<input type="hidden" name="number" value="%s">'
+            '<input class="in" name="text" value="%s" placeholder="%s" size="18">'
+            '<button class="btn" type="submit">synthesise</button></form>'
+            "%s%s</div></div>"
+            % (esc(num), esc(name),
+               ("  " + clip_player("name-%s.wav" % num)) if rec else "",
+               esc(src if rec else "generated by espeak"),
+               esc(num), esc(cur, quote=True), esc(name, quote=True),
+               ('<form class="row" method="post" action="/names/set" style="margin:0">'
+                '<input type="hidden" name="number" value="%s">'
+                '<select class="in" name="name">%s</select>'
+                '<button class="btn" type="submit">use recording</button></form>'
+                % (esc(num), pick)) if clips else "",
+               ('<form class="inline" method="post" action="/names/del">'
+                '<input type="hidden" name="number" value="%s">'
+                '<button class="btn" type="submit">reset</button></form>'
+                % esc(num)) if rec else ""))
+    out.append('<p class="hint">Record a name by dialling <span class="mono">*96</span>, '
+               "or press <span class=\"mono\">3434</span> mid-call to capture one from "
+               "the conversation &mdash; then pick it from the dropdown.</p>"
+               "</div></div>")
+    return "".join(out)
+
+
+@app.post("/names/say")
+def act_name_say(number: str = Form(...), text: str = Form(""),
+                 _=Depends(require_auth)):
+    num = clean_number(number)
+    if not num:
+        return back("invalid number", True, "/audio")
+    txt = clean_value(text)
+    if not txt:
+        return _clip_cmd(["name-del", num], "cleared -- back to the generated name")
+    return _clip_cmd(["name-say", num, txt], "name synthesised")
+
+
+@app.post("/names/set")
+def act_name_set(number: str = Form(...), name: str = Form(...),
+                 _=Depends(require_auth)):
+    num = clean_number(number)
+    if not num:
+        return back("invalid number", True, "/audio")
+    return _clip_cmd(["name-set", num, os.path.basename(name)],
+                     "recording installed as the spoken name")
+
+
+@app.post("/names/del")
+def act_name_del(number: str = Form(...), _=Depends(require_auth)):
+    num = clean_number(number)
+    if not num:
+        return back("invalid number", True, "/audio")
+    return _clip_cmd(["name-del", num], "back to the generated name")
+
+
+def clips_card():
+    rows = clip_files(100)
+    out = ['<div class="card"><h2>Recorded clips'
+           '<span class="note">dial *96</span></h2><div class="body">',
+           '<p class="hint" style="margin-top:0">Your own voice instead of espeak. '
+           'Dial <span class="mono">*96</span> from any registered handset, speak, '
+           'press <span class="mono">#</span>, then '
+           '<span class="mono">1</span> replay &middot; '
+           '<span class="mono">2</span> save &middot; '
+           '<span class="mono">3</span> re-record &middot; '
+           '<span class="mono">*</span> cancel. Nothing enters the library until you '
+           'press 2, so you can re-record as many times as you like.</p>']
+
+    if not rows:
+        out.append('<div class="empty">no clips in %s yet</div>' % esc(CLIP_DIR))
+    for stem, mtime, size in rows:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+        lbl = clip_label(stem)
+        assign = "".join(
+            '<form class="inline" method="post" action="/clips/assign" '
+            'style="margin-right:.4rem"><input type="hidden" name="role" value="%s">'
+            '<input type="hidden" name="name" value="%s">'
+            '<button class="btn" type="submit">use as %s</button></form>'
+            % (esc(r), esc(stem), esc(t.lower())) for r, t, _b in CLIP_ROLES)
+        out.append(
+            '<div style="border-top:1px solid #222;padding:.75rem 0">'
+            '<div class="row" style="align-items:center">'
+            '<span class="mono">%s</span>'
+            '<span class="hint" style="margin:0">%s &middot; %.1fs &middot; %d bytes</span>'
+            "%s</div>"
+            '<div class="row" style="margin-top:.45rem">'
+            '<form class="row" method="post" action="/clips/label" style="margin:0">'
+            '<input type="hidden" name="name" value="%s">'
+            '<input class="in" name="label" value="%s" placeholder="label this clip" '
+            'size="26"><button class="btn" type="submit">save label</button></form>'
+            '<form class="inline" method="post" action="/clips/broadcast" '
+            'style="margin-right:.4rem"><input type="hidden" name="name" value="%s">'
+            '<button class="btn" type="submit">play on handsets</button></form>'
+            "%s"
+            '<form class="inline" method="post" action="/clips/del">'
+            '<input type="hidden" name="name" value="%s">'
+            '<button class="btn" type="submit">delete</button></form>'
+            "</div></div>"
+            % (esc(stem), esc(when), clip_secs(size), size, clip_player(stem + ".wav"),
+               esc(stem), esc(lbl, quote=True), esc(stem), assign, esc(stem)))
+
+    out.append('<p class="hint">&ldquo;Play on handsets&rdquo; originates a call to '
+               'each endpoint in <span class="mono">ORATA_PAGE_ENDPOINTS</span> and '
+               "plays the clip when it is answered &mdash; the phones <b>ring</b>, "
+               "this is not auto-answer paging.</p></div></div>")
+    return "".join(out)
+
+
+@app.get("/clips/file")
+def clip_file(f: str = "", _=Depends(require_auth)):
+    name = os.path.basename(f or "")
+    if not CLIP_SERVE_RE.match(name):
+        raise HTTPException(status_code=400, detail="bad clip name")
+    try:
+        with open(os.path.join(CLIP_DIR, name), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        raise HTTPException(status_code=404, detail="no such clip")
+    return Response(data, media_type="audio/wav",
+                    headers={"Cache-Control": "no-store",
+                             "Content-Disposition": 'inline; filename="%s"' % name,
+                             "X-Content-Type-Options": "nosniff"})
+
+
+def _clip_cmd(args, ok_msg):
+    rc, out = sh([CLIP_SH] + args, timeout=30)
+    if rc == 0:
+        return back(ok_msg, False, "/audio")
+    return back((out.strip().splitlines() or ["failed"])[-1][:140], True, "/audio")
+
+
+@app.post("/clips/label")
+def act_clip_label(name: str = Form(...), label: str = Form(""),
+                   _=Depends(require_auth)):
+    return _clip_cmd(["label", os.path.basename(name), clean_value(label)],
+                     "label saved")
+
+
+@app.post("/clips/del")
+def act_clip_del(name: str = Form(...), _=Depends(require_auth)):
+    return _clip_cmd(["del", os.path.basename(name)], "clip deleted")
+
+
+@app.post("/clips/assign")
+def act_clip_assign(role: str = Form(...), name: str = Form(...),
+                    _=Depends(require_auth)):
+    return _clip_cmd(["assign", os.path.basename(role), os.path.basename(name)],
+                     "clip installed -- it applies to the next call")
+
+
+@app.post("/clips/say")
+def act_clip_say(role: str = Form(...), text: str = Form(""),
+                 _=Depends(require_auth)):
+    txt = clean_value(text)
+    if not txt:
+        # Empty box means "stop overriding", which is less surprising than
+        # synthesising silence.
+        return _clip_cmd(["unassign", os.path.basename(role)],
+                         "prompt cleared -- back to the built-in")
+    return _clip_cmd(["say", os.path.basename(role), txt],
+                     "prompt synthesised -- it applies to the next call")
+
+
+@app.post("/clips/unassign")
+def act_clip_unassign(role: str = Form(...), _=Depends(require_auth)):
+    return _clip_cmd(["unassign", os.path.basename(role)],
+                     "reverted to the built-in prompt")
+
+
+@app.post("/clips/broadcast")
+def act_clip_broadcast(name: str = Form(...), _=Depends(require_auth)):
+    return _clip_cmd(["broadcast", os.path.basename(name)], "sent to the handsets")
 
 
 # =====================================================================
