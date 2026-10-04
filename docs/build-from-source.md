@@ -183,9 +183,9 @@ samples.
 | `voicemail.conf` | shipped (mailboxes commented) | `make samples` |
 | CVE patching | `apt upgrade` | **manual rebuild** |
 
-The sounds path change matters: the README's espeak + sox `press-one` recipe
-targets `/usr/share/asterisk/sounds/en/custom`, which is **wrong for a source
-install**. Use:
+The sounds path change matters: older install instructions targeted
+`/usr/share/asterisk/sounds/en/custom`, which is **wrong for this source
+install**. The current [install guide](install.md) and README use:
 
     /var/lib/asterisk/sounds/en/custom/press-one.gsm
 

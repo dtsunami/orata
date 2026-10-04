@@ -1,7 +1,9 @@
 # Alexa path B: virtual contact sensor
 
-Official, stable alternative to `alexa_remote_control.sh`. Trades dynamic
-speech for auth that does not rot.
+Optional alternative to `alexa_remote_control.sh`, not the next required
+milestone. Uses official OAuth/event endpoints and trades dynamic speech for
+static Routine text. Tokens can still be revoked and cloud behavior can change.
+ARC's initial smoke test is user-confirmed; see [next-steps.md](next-steps.md).
 
 **Everything in this document is unverified.** It was written from API
 knowledge, not from a working deployment. Amazon's console UI in particular
@@ -13,7 +15,7 @@ moves around; treat the click-paths as directional.
 |---|---|---|
 | Speech | `"Call from Mom"` — arbitrary, from astdb | static per sensor, baked into a Routine |
 | Auth | session cookie, MFA-derived | LWA OAuth refresh token |
-| Breaks | ~annually | when you revoke the link |
+| Risks | unofficial API/login changes, token revocation | token revocation, skill/cloud/Routine changes |
 | Off-box deps | none | AWS account + Lambda + developer account |
 | Adding a person | `orata-cnam.sh add` | new sensor + new Routine, by hand in the app |
 | Runtime on the Pi | ~1000 lines of third-party bash | one curl to a documented endpoint |

@@ -1,78 +1,67 @@
 # orata
 
-Home phone on a voip.ms DID, terminated on a Raspberry Pi 4 running stock
-Asterisk from Debian's repo. Incoming calls are announced by name on Echo
-devices.
+Home phone on a voip.ms DID, terminated on a Raspberry Pi 4 running
+source-built **Asterisk 22 LTS on Debian 13**. Incoming accepted calls are
+announced by name on Echo devices.
 
-No Docker. No FreePBX. No Home Assistant. No daemon beyond Asterisk itself.
+No runtime Docker, FreePBX or Home Assistant. Core call handling uses Asterisk
+and shell scripts; the optional admin UI is a small FastAPI/uvicorn service.
+
+## Status — 2026-10-04
+
+- PSTN inbound/outbound calls with MicroSIP and two-way audio were verified.
+- **Alexa smoke test worked**, as reported by the user after refresh-token setup.
+- Dashboard/configuration/audio fixes are in source; **19 regression tests passed**.
+- Next: power up remaining Echos, verify each room, then real inbound-call and
+  unattended-operation acceptance. Multi-Echo coverage is not yet confirmed.
+
+Start here: [current handoff](HANDOFF.md), [install / safe update](docs/install.md),
+[prioritized next steps](docs/next-steps.md).
 
 ## Moving parts
 
 | Thing | What it is | Breaks when |
 |---|---|---|
 | Asterisk 22 LTS | **built from source** — not packaged in Debian 13 | you must rebuild for CVEs yourself; see `docs/build-from-source.md` |
-| `orata-announce.sh` | bash + curl, fired by dialplan | never (it's 40 lines) |
-| `alexa_remote_control.sh` | third-party bash script | Amazon changes auth, ~annually |
-| ntfy | HTTP POST to a public topic | never |
-| `orata-alexa-sensor.sh` | bash + curl, official Alexa endpoints | only if you unlink the skill |
+| `orata-announce.sh` | shell notifier + local WAV render, fired by dialplan | permissions, dependencies, network/channel errors; must not break calls |
+| `alexa_remote_control.sh` | third-party bash + curl/jq, refresh token and cookie cache | unofficial API/auth changes, revoked token, unavailable devices |
+| ntfy | optional independent HTTP push | network/service/auth/subscription failures |
+| `orata_web.py` | optional FastAPI admin service | service/config/dependency errors; phone does not depend on it |
+| `orata-alexa-sensor.sh` | optional static-speech route, unverified deployment | skill/token/cloud/Routine changes |
 
 The Alexa layer is deliberately quarantined. It is invoked backgrounded,
 wrapped in `timeout`, and its exit code is ignored. If Amazon breaks it,
-calls still ring and you still get a phone push.
+calls must still ring; phone push remains independent **if ntfy is configured
+and its subscription/delivery work**.
 
-There are two Alexa paths, selected by `ORATA_ALEXA_MODE` in
+Two Alexa paths are selected by `ORATA_ALEXA_MODE` in
 `/etc/orata/announce.conf`:
 
-- **`arc`** (default) — `alexa_remote_control.sh`. Dynamic "Call from Mom"
-  straight from the name book. Cookie auth, breaks about once a year.
-- **`sensor`** — virtual contact sensor + Alexa Routine. Speech text is
-  static per sensor, but the auth never rots. Needs an AWS Lambda and a
-  Smart Home skill: see `docs/alexa-sensor.md`.
+- **`arc`** (default, initial smoke test user-confirmed) — dynamic "Call from
+  Mom" from the name book, via refresh-token/cookie authentication and an
+  unofficial API.
+- **`sensor`** (optional, unverified deployment) — static speech per virtual
+  contact sensor/Routine, official OAuth, additional AWS/skill setup:
+  [design notes](docs/alexa-sensor.md).
 
-`arc` ships as the default because per-caller names are the point. `sensor`
-is the planned migration when the cookie next dies — set it up before that
-happens and the switch is one line.
+Finish ARC coverage and operational acceptance first. Sensor mode is not
+automatic failover and is not required to finish the current scope.
 
-## Install
+## Install or update
 
-On the Pi (Debian 13 trixie arm64, **booted from USB SSD** — CDR logging kills SD cards):
+Use **[docs/install.md](docs/install.md)** for separate fresh-install and
+working-Pi update paths. It covers source-build prerequisites, config ownership,
+features/prompts/mailbox, UI installation, Alexa setup and verification.
 
-    sudo apt update && sudo apt install curl jq
+Already running? Update scripts/UI without replacing live configs:
 
-**Asterisk is not in Debian 13** — `apt install asterisk` fails with `no
-installation candidate`. It must be built from source. Do that first, then
-return here: `docs/build-from-source.md`.
+    sudo install -m 755 bin/orata_web.py bin/orata-cnam.sh bin/orata-clip.sh \
+      bin/orata-announce.sh bin/orata-alexa-sensor.sh /usr/local/bin/
+    sudo systemctl restart orata-web
 
-Copy this repo over, then:
-
-    # configs
-    sudo cp asterisk/pjsip.conf asterisk/extensions.conf /etc/asterisk/
-    sudo chown asterisk:asterisk /etc/asterisk/pjsip.conf /etc/asterisk/extensions.conf
-    sudo chmod 640 /etc/asterisk/pjsip.conf
-
-    # scripts
-    sudo cp bin/orata-*.sh /usr/local/bin/
-    sudo chmod 755 /usr/local/bin/orata-*.sh
-
-    # config, log dir, state dir (LWA token cache for the sensor path)
-    sudo mkdir -p /etc/orata /var/log/orata /var/lib/orata
-    sudo cp etc/announce.conf /etc/orata/
-    sudo chown asterisk:asterisk /var/log/orata /var/lib/orata
-    sudo chmod 600 /etc/orata/announce.conf
-    sudo chmod 700 /var/lib/orata
-
-If you edited anything on Windows, strip CRLFs first or bash will fail with
-`bad interpreter`:
-
-    sed -i 's/\r$//' /usr/local/bin/orata-*.sh /etc/asterisk/*.conf
-
-Then edit `/etc/asterisk/pjsip.conf` (POP + credentials), `/etc/orata/announce.conf`,
-and reload:
-
-    sudo asterisk -rx "core reload"
-    sudo asterisk -rx "pjsip show registrations"
-
-You want to see `Registered`.
+This assumes the UI is installed. Merge dialplan/features changes separately
+and reload only the affected component. **Never copy repo config templates over
+working secrets, ring groups or NAT settings.**
 
 ## Alexa setup
 
@@ -95,8 +84,9 @@ Important corrections to older instructions:
 - Do Not Disturb and low Echo volume can suppress speech. `alexa OK` only
   means upstream returned success; listen to confirm playback.
 
-The instructions were checked against upstream source on 2026-10-04.
-Authentication and audible playback still require testing on your account.
+On 2026-10-04 the user reported a successful Alexa smoke test after obtaining
+a token and configuring ARC. Multi-Echo coverage and inbound-call announcements
+still need explicit acceptance checks; see [next steps](docs/next-steps.md).
 
 ## Web UI
 
@@ -111,13 +101,13 @@ Caller edits use `orata-cnam.sh`; voice prompts and clips use `orata-clip.sh`.
 The CLI remains authoritative. System config files stay hand-edited.
 
 The **Audio** tab plays back announcements. `orata-announce.sh` renders every
-phrase to a WAV on the Pi (`apt install espeak-ng`) before it calls out, so
+phrase to a WAV on the Pi (`apt install espeak-ng sox`) before it calls out, so
 you can hear what was announced without an Echo in earshot. Useful well before
 Alexa is set up at all — it is how you confirm the name book resolved and the
 phrase came out right.
 
-It proves the phrase, **not** audible Echo playback. `alexa OK` means the
-API command succeeded; Do Not Disturb or volume can still suppress speech.
+It proves the phrase, **not** audible Echo playback. `alexa OK` means ARC
+returned success, not that Amazon accepted it or that an Echo spoke.
 Local renders do not record conversations and are kept in a ring buffer
 (`ORATA_AUDIO_KEEP`, default 50). Handset recording is separate and explicit:
 `*96` or `3434`, described below.
@@ -127,16 +117,15 @@ installed from Debian packages, not pip — trixie's python3 is
 PEP 668 externally-managed, so `pip install` into the system interpreter is
 refused, and a venv would be a second thing to maintain.
 
-    sudo apt install python3-fastapi python3-uvicorn
-    sudo cp bin/orata_web.py /usr/local/bin/ && sudo chmod 755 /usr/local/bin/orata_web.py
-    sudo cp etc/web.conf /etc/orata/ && sudo chmod 600 /etc/orata/web.conf
-    head -c 24 /dev/urandom | base64      # paste into ORATA_WEB_TOKEN
-    sudo cp etc/orata-web.service /etc/systemd/system/
-    sudo systemctl daemon-reload && sudo systemctl enable --now orata-web
+    sudo ./bin/orata-web-install.sh --bind 127.0.0.1 --port 8088
 
-Binds `127.0.0.1` by default and **refuses to start** on `0.0.0.0` or with an
-empty token. Reach it via `ssh -L 8088:127.0.0.1:8088 pi@raspberrypi`, or bind
-it to the Pi's WireGuard address. No TLS — this never goes on the internet.
+The config template defaults to loopback; the installer **without --bind**
+auto-detects a LAN IP. It generates a query-safe token and preserves it on
+rerun, but re-applies bind/port settings. Use explicit flags to retain those.
+
+The server refuses an empty token or wildcard bind without explicit override.
+Reach loopback via `ssh -L 8088:127.0.0.1:8088 USER@PI`, or bind a specific
+trusted LAN/WireGuard address. No TLS or public exposure.
 
 Full threat model in `docs/web-ui.md`.
 
@@ -152,9 +141,9 @@ robocaller that the line is live.
 
 ## The name book
 
-Announcements say "Call from Mom" only if the number is in the name book.
-Unknown numbers say "Call from an unknown number" (set `ORATA_SPEAK_DIGITS=1`
-to hear the digits instead).
+The local name book takes priority over carrier CNAM. Add a number here for
+a predictable "Call from Mom". Callers without a resolved name say "Call from
+an unknown number" (set `ORATA_SPEAK_DIGITS=1` to hear digits instead).
 
     orata-cnam.sh add 15551234567 "Mom"
     orata-cnam.sh list
@@ -165,25 +154,26 @@ database.
 
 ## The robocall gate
 
-Unknown callers get "press 1 to continue". Anyone who presses 1 is whitelisted
-in astdb permanently and goes straight through next time. Anyone in the name
-book skips the gate entirely.
+With STRICT off, callers without a resolved name or whitelist entry get
+"press 1 to continue". Pressing 1 self-whitelists them for future calls.
+Named/allowed non-owners skip the gate; owners always hear it so they can
+enter 3434. Carrier CNAM counts as a resolved name.
 
     orata-cnam.sh allow-list
     orata-cnam.sh allow-del 15558675309
 
 You need a `press-one` prompt. Generate one with espeak + sox:
 
-    sudo apt install espeak sox
-    sudo mkdir -p /usr/share/asterisk/sounds/en/custom
-    espeak -w /tmp/p1.wav "Press 1 to continue."
+    sudo apt install espeak-ng sox
+    sudo mkdir -p /var/lib/asterisk/sounds/en/custom
+    espeak-ng -w /tmp/p1.wav "Press 1 to continue."
     sudo sox /tmp/p1.wav -r 8000 -c 1 -t gsm \
-      /usr/share/asterisk/sounds/en/custom/press-one.gsm
+      /var/lib/asterisk/sounds/en/custom/press-one.gsm
 
-Verify Asterisk can see it (the dialplan refers to it as `custom/press-one`,
-without the extension):
+This is the source-build sound path. Verify Asterisk can see it (the dialplan
+refers to `custom/press-one`, without the extension):
 
-    sudo asterisk -rx "file convert /usr/share/asterisk/sounds/en/custom/press-one.gsm /tmp/verify.wav"
+    sudo asterisk -rx "file convert /var/lib/asterisk/sounds/en/custom/press-one.gsm /tmp/verify.wav"
 
 ## Recorded clips — your own voice
 
@@ -216,8 +206,8 @@ registered devices, never from the PSTN.
 
 ## Announce mode — `3434` from your own phone
 
-Call the house from your mobile and speak an announcement into every
-handset, live. The flow:
+Call the house from your mobile, record a clip, then broadcast the saved clip
+to the configured SIP handsets. This is not live audio or Echo playback. The flow:
 
 1. Call the DID from a number you have marked as an owner.
 2. You hear the gate prompt: *"Press 1 to continue."*
@@ -314,9 +304,9 @@ reload. Or assign a `*96` recording to use your own voice instead.
     orata-clip.sh roles                     # what is overridden
     orata-clip.sh unassign press-one        # back to the built-in
 
-Overrides live in `/var/lib/orata/clips/role-*.wav`. The dialplan checks for
-one and falls back to the `custom/` sound file, so an unset prompt is always
-safe — the UI can never leave a caller in silence.
+Overrides live in `/var/lib/orata/clips/role-*.wav`. The dialplan falls back to
+the installed `custom/` sound file when an override is absent. Check Diagnostics
+before clearing a prompt: a missing built-in file can leave the caller in silence.
 
 Needs `apt install espeak-ng sox`. **sox is not optional**: espeak emits
 22050 Hz and Asterisk wants 8 kHz, so without it the audio plays at the
@@ -331,6 +321,7 @@ Asterisk sounds tree — that is root-owned and outside the service unit's
 The overrides above make these unnecessary, but if you want working prompts
 before touching the UI:
 
+    sudo mkdir -p /var/lib/asterisk/sounds/en/custom
     for p in \
       "press-one:Press 1 to continue." \
       "rec-start:Speak after the beep, then press hash." \

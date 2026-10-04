@@ -2,6 +2,9 @@
 
 Three verification paths live here:
 
+- **`regression.py`** — current isolated UI/audio/ARC checks. All 19 passed
+  on 2026-10-04. It mocks Asterisk and ARC; it does not validate Amazon login.
+
 - **`selftest.conf`** — a dialplan context deployed *on the Pi* that drives
   the real inbound paths with a spoofed caller ID. This is what actually
   verified the call logic in session 3. See "On-Pi selftest" below.
@@ -11,7 +14,7 @@ Three verification paths live here:
   happened. Its results no longer transfer; two of its techniques were also
   found to be wrong (see below).
 
-**Neither is a deployment target.** HANDOFF rejects Docker for running
+**These rigs are not runtime deployment targets.** HANDOFF rejects Docker for running
 orata; that decision stands.
 
 ## Isolated web/audio regressions
@@ -92,10 +95,12 @@ The repo is mounted read-only; everything happens to copies inside the
 container. Rebuild after editing `run-tests.sh` (it is COPYed, not mounted —
 a CRLF-laden script mounted from Windows cannot bootstrap itself).
 
-## What a green run proves
+## Historical intended coverage (not current proof)
 
-Debian 12 + the distro Asterisk 20 package, same as the Pi. So these results
-transfer:
+The original rig used Debian 12 + packaged Asterisk 20. That is **not** the
+current Pi environment. The list below records its intended coverage;
+`dialplan eval` and synthetic caller-ID flaws described above invalidate
+some assertions. Use current regressions and on-Pi acceptance instead:
 
 - No CRLF damage; `bash -n` and `py_compile` clean
 - `extensions.conf` and `pjsip.conf` **load** — context exists, all four
@@ -126,10 +131,11 @@ Untested, and only testable on the Pi:
 - `Read(digit,custom/press-one,1,,1,7)` — argument order and the 7s timeout
 - Actual inbound routing: does a blocked caller really get hung up on, does
   a known caller really skip the gate
-- Anything Alexa: both paths need real credentials
+- Audible Alexa playback: the user reported ARC smoke-test success separately;
+  multi-Echo and inbound-call checks remain open. Sensor mode is unverified.
 
-**A green run means the config and plumbing layer is sound. It does not mean
-the phone works.** Rungs 2–5 of the HANDOFF plan are unaffected.
+**A green container run is not proof of the current config, phone or Alexa.**
+See [current status](../HANDOFF.md) and [acceptance plan](../docs/next-steps.md).
 
 ## Is this the tech debt we said no to?
 
@@ -140,6 +146,5 @@ real. That reasoning is about the deployment, and it is untouched.
 A build-and-discard test container has a different cost profile: it is
 `--rm`, nothing persists, the Pi never learns it exists, and deleting `test/`
 removes it without trace. The one real risk is drift — if the container's
-Asterisk stops matching the Pi's, results quietly stop transferring. Both
-track Debian 12 stable, so that should not happen before the next Debian
-release.
+Asterisk stops matching the Pi's, results quietly stop transferring. That drift has already happened: this rig is Debian 12, the Pi is Debian 13
+with source-built Asterisk 22. Treat it as historical until updated.

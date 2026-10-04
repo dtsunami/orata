@@ -7,8 +7,10 @@ a test harness. No frontend build system or additional runtime dependencies.
 Installed from Debian packages (`python3-fastapi`, `python3-uvicorn`). No pip,
 no venv, no database.
 
-The current source has isolated regression coverage (`python3 test/regression.py`).
-Browser layout and real handset recording/hangup behavior still need on-Pi checks.
+On 2026-10-04 all 19 isolated regression tests passed, including real WAV
+synthesis and mocked ARC delivery. The user reported that Alexa's smoke test
+worked. Full browser review and real handset
+recording/hangup acceptance remain open; see [next-steps.md](next-steps.md).
 
 ## The tension, stated up front
 
@@ -29,9 +31,9 @@ dial premium-rate numbers.
 
 Mitigations, all in the shipped defaults:
 
-- **Binds 127.0.0.1.** Reach it over an SSH tunnel, or bind to the Pi's
-  WireGuard address. It **refuses to start on 0.0.0.0** without an explicit
-  override flag.
+- **Config template binds 127.0.0.1; installer defaults to a LAN IP.** Use
+  explicit loopback + SSH tunnel or the Pi's WireGuard address for narrower
+  access. Wildcard binds **require an explicit override**.
 - **Refuses to start with an empty token.** An unconfigured instance is not a
   wide-open instance.
 - Token compared with `hmac.compare_digest`; cookie is `HttpOnly` +
@@ -40,7 +42,8 @@ Mitigations, all in the shipped defaults:
   backslashes, backticks, `$` and control characters, capped at 64 chars.
   Subprocess is invoked without a shell.
 - systemd unit is confined: `ProtectSystem=strict`, `NoNewPrivileges`,
-  `ReadWritePaths` limited to the Asterisk run dir and the log dir.
+  `ReadWritePaths` limited to the Asterisk run dir, Orata log dir and
+  `/var/lib/orata` (audio, clips and authentication state).
 
 **There is no TLS and no login rate limit.** Do not put this on the internet.
 The invariant from README stands: no port-forward, remote access over
@@ -57,8 +60,11 @@ That installs the Debian packages, copies `orata_web.py` into
 with the right ownership, generates a 24-byte token, installs and starts the
 systemd unit, and prints the URL with the token already in it.
 
-It is idempotent. Re-run it after editing the repo copy of `orata_web.py` and
-it reinstalls and restarts without touching your existing token.
+It preserves an existing token and unrelated config entries, but always writes
+the selected bind address and port (defaults: auto-detected LAN IP and 8088).
+When re-running, pass your intended `--bind` and `--port` explicitly. It updates
+only the web app and unit, not the recording/notifier scripts or dialplan.
+For a binary-only update that preserves bind/port, see [install.md](install.md).
 
 The directory creation is not optional detail: the unit sets
 `ProtectSystem=strict` with `ReadWritePaths=/var/run/asterisk /var/log/orata
@@ -120,7 +126,7 @@ So these stay hand-edited, and no amount of UI polish should absorb them:
 |---|---|
 | voip.ms POP + trunk credentials | `/etc/asterisk/pjsip.conf` |
 | voicemail PIN | `/etc/asterisk/voicemail.conf` |
-| Alexa mode, ntfy URL, LWA tokens | `/etc/orata/announce.conf` |
+| Alexa mode, ARC refresh token/region, ntfy URL, optional LWA tokens | `/etc/orata/announce.conf` |
 | selftest context `#include` | `/etc/asterisk/extensions.conf` |
 
 The Diagnostics tab *detects and reports* every one of these — stubbed
@@ -137,8 +143,8 @@ Registration is not proof of DID routing or two-way audio.
 
 `/configure` provides ordered entry points for setup, caller policy, prompts
 and testing, plus current announcement settings and instructions explaining
-each option. Help popovers work by touch or keyboard. Private ntfy URLs and
-LWA credentials are not displayed.
+each option. Help popovers work by touch or keyboard. Private ntfy URLs, ARC
+refresh tokens and LWA credentials are not displayed.
 
 Caller books and prompts are browser-editable. Trunk credentials, Alexa/ntfy
 settings, voicemail and dialplan globals remain file-managed. Announcement
@@ -159,7 +165,9 @@ something and it re-evaluates.
 | 2. Reload and register | `pjsip show registrations` says `Registered` |
 | 3. Register a softphone | `pjsip show contacts` has pc/mobile/desk |
 | 4. Load the name book | `cnam` book is non-empty |
-| 5. Announcements | ARC installed, or LWA credentials set, or mode `off` |
+| 5. Announcements | ARC executable + jq + token + `speak`, sensor credentials, or mode `off`; both requires both paths |
+
+Step 5 checks configuration presence only, not authentication or audible speech.
 
 It names the portal fields and which pjsip.conf keys they map to, since the
 POP hostname appears in four places and the sub-account username in three.
@@ -192,12 +200,16 @@ failures show up. Prompt, clip and caller-name mutations use `orata-clip.sh`.
 The whitelist is not new; it has existed since session 1 and **self-learns**.
 Order of evaluation in `[from-voipms]`:
 
-1. `block/<num>` set? → `Hangup()`. No answer, no ring, no announce.
-2. Name resolved from `cnam/` or carrier CNAM? → straight to ring.
-3. `allow/<num>` set? → straight to ring.
-4. Otherwise → the gate: "press 1 to continue". Pressing 1 writes
-   `allow/<num>=1`, so they are never gated again.
-5. `STRICT=1` in `[globals]` → skip step 4 and reject outright.
+1. `block/<num>=1`? → `Hangup()`. No answer, no ring, no announce.
+2. Resolve name from `cnam/`, then carrier CNAM.
+3. `owner/<num>=1`? → gate, even if named/allowed; bypasses STRICT. Press 1
+   for normal calling, or owner-authorised 3434 for SIP clip broadcast.
+4. For non-owners, `allow/<num>=1` or a resolved name? → straight to ring.
+5. Remaining unknown with `STRICT=1`? → reject.
+6. Otherwise → "press 1 to continue". Passing writes `allow/<num>=1`.
+
+A number absent from the local name book may still skip the gate if carrier
+CNAM is present. Owner checks rely on spoofable caller ID, not strong auth.
 
 Strict mode turns the system from "filter robots" into "invitation only."
 Legitimate strangers — a doctor's office, a delivery driver, a school — get
@@ -249,12 +261,12 @@ lists the most recent 50 newest-first with an inline player, the **Log** tab
 puts a `play` link on any line that produced one, and firing an announcement
 from the **Harness** tab shows a player in the result card.
 
-**What this does and does not prove.** It proves the dialplan invoked the
-script, the name book resolved, and the phrase came out right — "Call from
-Mom" and not "Call from an unknown number". It says nothing whatsoever about
-whether Amazon spoke it. Only `alexa OK` in the log proves that. The UI
-repeats this warning in three places because it is an easy and expensive
-thing to confuse.
+**What this does and does not prove.** It proves the script composed/rendered
+the supplied phrase. A Harness invocation bypasses the inbound dialplan, so
+it does not independently prove inbound routing or name-book resolution.
+Neither the WAV nor `alexa OK` proves audible playback: ARC returning success
+can hide HTTP errors, and Echo volume/DND can suppress speech. Test a real
+call and listen on the target Echo for end-to-end confirmation.
 
 The practical use is debugging the *phrase*, which is where the mistakes
 actually are: a number in the book in the wrong format, `ORATA_SPEAK_DIGITS`
@@ -270,12 +282,11 @@ In `announce.conf` (the source of truth; `web.conf`'s
     ORATA_AUDIO_KEEP=50                       # ring buffer
     ORATA_TTS=                                # blank = autodetect
 
-Needs `apt install espeak-ng`. Without it you get `audio SKIP` and an empty
-tab; nothing else changes.
+Needs `apt install espeak-ng sox` for rendering and recorded-name assembly.
+Without TTS you get `audio SKIP`; remote announcements can still work.
 
 `ORATA_AUDIO_KEEP` is a hard ring buffer — the newest N survive, everything
-older is deleted on **every** call. At a few tens of KB per file, 50 is well
-under a megabyte. This matters: unbounded recordings are how you fill the
+older is deleted on **every** call. Size depends on phrase length; 8 kHz 16-bit mono uses about 16 KB/second. This matters: unbounded recordings are how you fill the
 SSD, which is the failure mode this project already designed around once.
 
 The default directory is inside `/var/lib/orata`, which is `700
@@ -344,7 +355,9 @@ Check both `announce.log` and `journalctl -u orata-web`.
 Isolated regression checks (no live SIP, ntfy, Alexa or astdb writes):
 
     python3 test/regression.py
-    bash -n bin/orata-clip.sh bin/orata-announce.sh
+    for f in bin/orata-clip.sh bin/orata-announce.sh; do
+      bash -n "$f" || exit 1
+    done
     git diff --check
 
 Real synthesis coverage needs `espeak-ng` (or `espeak`) and `sox`; absent
@@ -359,8 +372,7 @@ not proof of runtime hangup handling. Browser appearance needs visual review.
 - **No CSRF token.** `SameSite=Strict` on the cookie is the only protection.
   Adequate for a single-user LAN tool, not for anything wider.
 - **No logrotate for `announce.log`.** Predates this change and still unfixed;
-  the UI only reads the last 8 KB, so it will not choke, but the file grows
-  forever. Note the asymmetry: the WAVs *are* bounded (`ORATA_AUDIO_KEEP`),
+  the UI reads a bounded tail, but the file grows forever. Note the asymmetry: the WAVs *are* bounded (`ORATA_AUDIO_KEEP`),
   the log they are indexed by is not.
 - **Audio playback is not proof of announcement.** The Audio tab tells you
   what the Pi composed, not what an Echo said. Reading it as end-to-end
