@@ -11,7 +11,9 @@
 # source of truth. Nothing here generates or overwrites a config file.
 #
 # Pages:
-#   /         books    -- cnam / allow / block / alexasensor
+#   /         dashboard -- live status and recent activity
+#   /configure guidance -- configuration entry points, help and live settings
+#   /books    books     -- cnam / owner / allow / block / alexasensor
 #   /diag     health   -- read-only probes, mutates nothing
 #   /harness  testing  -- call simulator + explicit actions
 #   /log      announce.log tail
@@ -50,7 +52,9 @@ def load_conf(path):
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip().strip('"').strip("'")
+                # Read exported ARC settings as data; never execute this file.
+                k = re.sub(r"^export\s+", "", k.strip())
+                cfg[k] = v.strip().strip('"').strip("'")
     except OSError:
         pass
     return cfg
@@ -82,6 +86,10 @@ esc = html.escape
 BOOKS = [
     ("cnam", "Name book", "add", "del", "Spoken name",
      "Spoken name. An entry here also skips the robocall gate."),
+    ("owner", "Announcement owners", "owner-add", "owner-del", None,
+     "May enter 3434 at the inbound gate to record and broadcast. Owners always "
+     "hear the gate, even with a name or whitelist entry. Caller ID is spoofable; "
+     "this is not strong authentication."),
     ("allow", "Whitelist", "allow-add", "allow-del", None,
      "Past the gate permanently. Self-learns when a caller presses 1."),
     ("block", "Blocklist", "block-add", "block-del", None,
@@ -387,6 +395,24 @@ pre{background:#0a0d11;border:1px solid #1b222a;border-radius:9px;padding:.8rem;
 .card .body li{margin:.25rem 0;font-size:.89rem}
 pre.cmd{background:#0a0d11;border-color:#223042;color:#cfe3dd;font-size:.8rem}
 footer{color:#5d6876;font-size:.78rem;margin-top:2rem;text-align:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:1rem}
+.grid>.card{margin:0 0 1rem}
+.metric{font-size:1.35rem;font-weight:650;letter-spacing:-.02em;margin:.3rem 0}
+.field{display:flex;flex-direction:column;gap:.25rem;font-size:.8rem;color:#93a0b0}
+form.add{align-items:end}
+.help{position:relative;display:inline-block;text-transform:none;letter-spacing:0}
+.help summary{cursor:help;list-style:none;border:1px solid #3a4553;border-radius:50%;
+ width:1.3rem;height:1.3rem;text-align:center;color:#9aa4b2;font-size:.8rem}
+.help summary::-webkit-details-marker{display:none}
+.help[open] .tip{display:block}
+.card:has(.help[open]){overflow:visible;position:relative;z-index:10}
+.tip{display:none;position:absolute;top:1.6rem;left:-8rem;width:17rem;max-width:80vw;
+ z-index:30;background:#1b222b;border:1px solid #3a4553;border-radius:8px;
+ padding:.7rem;color:#e7ecf3;font-size:.82rem;font-weight:400;box-shadow:0 8px 24px #0008}
+a.btn{display:inline-block}a.btn:hover{text-decoration:none}
+a:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid #2dd4bf;
+ outline-offset:3px}
+.table-scroll{overflow-x:auto}
 @media(max-width:34rem){nav a{padding:.35rem .5rem;font-size:.82rem}
  .chk{grid-template-columns:1fr}.chk .dt,.chk .hn{grid-column:1}}
 """
@@ -416,9 +442,9 @@ orata <span class="tag">{{HOST}}</span></span>
 </div></body></html>
 """
 
-TABS = [("/setup", "Setup"), ("/devices", "Devices"), ("/", "Books"),
-        ("/diag", "Diagnostics"), ("/harness", "Harness"),
-        ("/audio", "Audio"), ("/log", "Log")]
+TABS = [("/", "Dashboard"), ("/configure", "Configure"), ("/books", "Books"),
+        ("/devices", "Devices"), ("/audio", "Audio"), ("/diag", "Diagnostics"),
+        ("/harness", "Harness"), ("/log", "Log")]
 
 
 def render(active, title, body, flash=""):
@@ -465,7 +491,7 @@ async def on_http_error(request: Request, exc: HTTPException):
     return PlainTextResponse("orata: %s\n" % exc.detail, status_code=exc.status_code)
 
 
-def back(msg, err=False, to="/"):
+def back(msg, err=False, to="/books"):
     sep = "&" if "?" in to else "?"
     return RedirectResponse(
         "%s%smsg=%s%s" % (to, sep, urllib.parse.quote_plus(msg),
@@ -485,13 +511,222 @@ def favicon_ico():
 
 
 # =====================================================================
+# dashboard + configuration guide -- no mutations on page load
+# =====================================================================
+
+def help_tip(text):
+    # Native details is usable with touch and keyboard; title alone is not.
+    return ('<details class="help"><summary aria-label="Help" title="%s">?</summary>'
+            '<span class="tip">%s</span></details>' % (esc(text, quote=True), esc(text)))
+
+
+def status_card(title, value, state, detail, href, link, help_text):
+    return ('<section class="card"><h2>%s%s</h2><div class="body">'
+            '%s<div class="metric">%s</div><p class="hint">%s</p>'
+            '<a href="%s">%s &rarr;</a></div></section>'
+            % (esc(title), help_tip(help_text), pill(state), esc(value), esc(detail),
+               esc(href, quote=True), esc(link)))
+
+
+def media_checks():
+    checks = []
+    for title, path in (("Announcement WAV directory", AUDIO_DIR),
+                        ("Clip library directory", CLIP_DIR)):
+        if not os.path.isdir(path):
+            checks.append(chk("warn", title, "not created: " + path,
+                              "It is created on the first render/save. The asterisk "
+                              "user needs write access to its parent directory."))
+        elif not os.access(path, os.R_OK | os.X_OK):
+            checks.append(chk("fail", title, "not readable: " + path,
+                              "Check directory ownership and execute permission for asterisk."))
+        elif not os.access(path, os.W_OK):
+            checks.append(chk("fail", title, "not writable: " + path,
+                              "Check asterisk ownership and the service ReadWritePaths."))
+        else:
+            checks.append(chk("pass", title, "readable and writable: " + path))
+    return checks
+
+
+@app.get("/", response_class=HTMLResponse)
+def page_dashboard(request: Request, _=Depends(require_auth)):
+    if request.query_params.get("token"):
+        r = RedirectResponse("/", status_code=303)
+        r.set_cookie("orata_token", TOKEN, max_age=2592000, httponly=True,
+                     samesite="strict", secure=request.url.scheme == "https", path="/")
+        return r
+
+    up, version = asterisk_up()
+    reg = reg_status() if up else None
+    contacts = contact_map() if up else {}
+    available = [name for name, c in contacts.items() if c[0].startswith("Avail")]
+    acfg = load_conf(ANNOUNCE_CONF)
+    renders, clips = audio_files(500), clip_files(500)
+    tail = log_tail(60)
+    failures = [line for line in tail if "FAIL" in line]
+    body = ['<h1>Dashboard</h1><p class="lede">Live phone status and recent activity. '
+            'Read-only: opening this page never records, rings a handset, or sends '
+            'an announcement. <a href="/">Refresh status</a>.</p>']
+    if not up or reg != "Registered":
+        body.append('<div class="verdict bad"><b>Phone needs attention.</b> '
+                    '<a href="/setup">Open the setup walkthrough</a> or '
+                    '<a href="/diag">run detailed diagnostics</a>.</div>')
+    elif failures:
+        body.append('<div class="verdict bad"><b>Recent notification or recording failures.</b> '
+                    'Call handling may still work. <a href="/log">Review the log</a>.</div>')
+    else:
+        body.append('<div class="verdict good"><b>Asterisk is reachable and the trunk is '
+                    'registered.</b> This does not prove inbound audio or Echo playback.</div>')
+
+    cards = [
+        status_card("Phone engine", "Running" if up else "Unreachable",
+                    "pass" if up else "fail", version.splitlines()[0] if version else "No CLI response",
+                    "/diag", "Diagnostics", "Queries Asterisk's CLI; does not place a call."),
+        status_card("voip.ms trunk", reg or "Not registered", "pass" if reg == "Registered" else "fail",
+                    "Inbound DID routing must also point to this sub-account.",
+                    "/setup", "Registration help", "Registered means the SIP login succeeded, "
+                    "not that DID routing or two-way audio has been tested."),
+        status_card("Handsets", "%d available" % len(available), "pass" if available else "warn",
+                    ", ".join(available) or "No available contacts reported.",
+                    "/devices", "Connect a handset", "Availability is Asterisk's contact status. "
+                    "A registered but unreachable handset may not ring."),
+        status_card("Announcements", acfg.get("ORATA_ALEXA_MODE", "arc"),
+                    "warn" if failures else "info",
+                    "%d FAIL line(s) in the last %d log lines; ntfy %s."
+                    % (len(failures), len(tail), "configured" if acfg.get("ORATA_NTFY_URL") else "not set"),
+                    "/configure#announcements", "Configure delivery",
+                    "Mode selects Alexa delivery. off disables Alexa, not local WAVs or ntfy. "
+                    "A successful API call is not proof the Echo was audible."),
+        status_card("Audio library", "%d renders / %d clips" % (len(renders), len(clips)),
+                    "info", "Generated caller phrases and explicitly recorded voice clips.",
+                    "/audio", "Listen and edit prompts",
+                    "Local renders live separately from handset recordings. Audio playback "
+                    "does not contact Amazon."),
+    ]
+    try:
+        fs = os.statvfs(AUDIO_DIR if os.path.isdir(AUDIO_DIR) else "/")
+        free = fs.f_bavail * fs.f_frsize / (1024 ** 3)
+        cards.append(status_card("Storage", "%.1f GiB free" % free, "warn" if free < 1 else "pass",
+                                 "Free space on the announcement filesystem.",
+                                 "/diag", "Storage checks", "WAV retention is bounded; logs still "
+                                 "need log rotation. Less than 1 GiB free is a warning."))
+    except OSError:
+        cards.append(status_card("Storage", "Unavailable", "warn", "Could not query free space.",
+                                 "/diag", "Storage checks", "No files were written by this check."))
+    body.append('<div class="grid">%s</div>' % "".join(cards))
+    body.append('<div class="card"><h2>Quick actions</h2><div class="body row">'
+                '<a class="btn primary" href="/configure">Configure orata</a>'
+                '<a class="btn" href="/books">Manage callers</a>'
+                '<a class="btn" href="/audio">Prompts &amp; recordings</a>'
+                '<a class="btn" href="/harness">Test an announcement</a></div></div>')
+    checks = media_checks()
+    body.append(result_card("Recording paths", [(c["s"], c["n"], c["d"] +
+                                                (" — " + c["h"] if c["h"] else "")) for c in checks]))
+    body.append('<div class="card"><h2>Recent activity'
+                '<span class="note"><a href="/log">Full log</a></span></h2>'
+                '<div class="body"><pre>%s</pre></div></div>'
+                % esc("\n".join(tail[-8:]) or "No readable announcement log yet."))
+    return render("/", "orata - dashboard", "".join(body), flash_of(request))
+
+
+@app.get("/configure", response_class=HTMLResponse)
+def page_configure(request: Request, _=Depends(require_auth)):
+    acfg = load_conf(ANNOUNCE_CONF)
+    body = ['<h1>Configure orata</h1><p class="lede">Start with callers and prompts, '
+            'then test the result. The <b>?</b> controls explain each setting. '
+            'Books and voice prompts are editable in the browser; system settings '
+            'below remain hand-edited so this UI never overwrites your configuration.</p>']
+    guides = [
+        ("1. Get a phone working", "Connect the trunk and at least one handset before "
+         "debugging Alexa. Follow the checked walkthrough, then call your DID.",
+         "/setup", "Setup walkthrough"),
+        ("2. Decide who gets through", "Add names for familiar callers. Whitelist skips "
+         "the gate; blocklist wins over everything. Owners can use 3434 and always hear the gate.",
+         "/books", "Edit caller books"),
+        ("3. Choose what callers hear", "Type a prompt and synthesise it, or dial *96, "
+         "speak, press #, then 2 to save. Assign that clip to a prompt or caller name.",
+         "/audio", "Edit prompts & voice clips"),
+        ("4. Check before relying on it", "Trace a caller without a call, or explicitly fire "
+         "an announcement. The announcement button sends real Alexa/ntfy traffic.",
+         "/harness", "Open test harness"),
+    ]
+    body.append('<div class="grid">')
+    for title, detail, href, label in guides:
+        body.append('<section class="card"><h2>%s</h2><div class="body"><p>%s</p>'
+                    '<a class="btn primary" href="%s">%s</a></div></section>'
+                    % (esc(title), esc(detail), esc(href), esc(label)))
+    body.append('</div><div class="card" id="announcements"><h2>Announcement settings'
+                '<span class="note">file-managed</span></h2><div class="body">'
+                '<p>Edit <span class="mono">%s</span>. Scripts read it on each invocation; '
+                'no Asterisk reload is needed for these settings. Restart the web service '
+                'after changing audio directories so the players use the same paths.</p>'
+                '<div class="table-scroll"><table><thead><tr><th>Setting</th>'
+                '<th>Current</th><th>How to choose</th></tr></thead><tbody>' % esc(ANNOUNCE_CONF))
+    fields = [
+        ("ORATA_ALEXA_MODE", "Alexa delivery", acfg.get("ORATA_ALEXA_MODE", "arc"),
+         "arc: dynamic names via session cookie. sensor: static Routine speech. "
+         "both: migration test (speaks twice). off: disable Alexa only."),
+        ("ORATA_ALEXA_DEVICES", "Echo devices", acfg.get("ORATA_ALEXA_DEVICES", "ALL"),
+         "ALL targets all supported devices. Use exact names from alexa_remote_control.sh -a; -l logs out."),
+        ("ORATA_ALEXA_CMD", "Speech command", acfg.get("ORATA_ALEXA_CMD", "speak"),
+         "Use speak with current upstream. announce is not a supported upstream command."),
+        ("ORATA_NTFY_URL", "Phone push fallback", "configured" if acfg.get("ORATA_NTFY_URL") else "disabled",
+         "Set an HTTPS ntfy topic URL. Use a long unguessable topic: public topics are not private."),
+        ("ORATA_RECORD_AUDIO", "Keep local phrase audio", acfg.get("ORATA_RECORD_AUDIO", "1"),
+         "1 renders caller phrases for browser playback; 0 disables new renders. Needs espeak-ng."),
+        ("ORATA_AUDIO_KEEP", "Phrase retention", acfg.get("ORATA_AUDIO_KEEP", "50"),
+         "Keep this many newest generated phrases. Older renders are removed on the next announcement."),
+        ("ORATA_CLIP_KEEP", "Voice clip retention", acfg.get("ORATA_CLIP_KEEP", "100"),
+         "Keep this many timestamped voice clips. Assigned prompts and caller-name copies are preserved."),
+        ("ORATA_PAGE_ENDPOINTS", "Broadcast handsets", acfg.get("ORATA_PAGE_ENDPOINTS", "pc mobile desk"),
+         "Space-separated PJSIP endpoint names. Handsets ring and play the clip when answered; not auto-answer."),
+        ("ORATA_SPEAK_DIGITS", "Unknown caller speech", acfg.get("ORATA_SPEAK_DIGITS", "0"),
+         "0 says unknown number. 1 reads the digits. Named callers still use their name."),
+    ]
+    for key, title, value, help_text in fields:
+        body.append('<tr><td>%s %s<br><span class="hint mono">%s</span></td>'
+                    '<td class="mono">%s</td><td>%s</td></tr>'
+                    % (esc(title), help_tip(help_text), esc(key), esc(value), esc(help_text)))
+    body.append('</tbody></table></div><p class="hint">LWA secrets and private ntfy '
+                'topic URLs are intentionally not displayed. <a href="/setup">Setup</a> '
+                'explains Alexa authentication. Do Not Disturb or low Echo volume can '
+                'suppress speech even after an API request succeeds.</p></div></div>')
+    body.append('<div class="card"><h2>Recording instructions &amp; troubleshooting</h2>'
+                '<div class="body"><ol><li><b>Library clip:</b> dial *96 from a registered '
+                'phone, speak after the beep, press #, then 1 to review or 2 to save.</li>'
+                '<li><b>Owner announcement:</b> authorise your number in '
+                '<a href="/books#owner">Announcement owners</a>, call the DID, enter 3434 '
+                'at the gate, speak and press #. Each saved clip is broadcast; hang up to stop.</li>'
+                '<li><b>Browser server error:</b> inspect '
+                '<span class="mono">journalctl -u orata-web -n 50 --no-pager</span>. '
+                'A clip OK line means the save succeeded, even if an older UI cannot list it.</li>'
+                '<li><b>No WAV:</b> check <a href="/diag">Diagnostics</a> for espeak-ng, sox, '
+                'directory permissions and CLIPDIR agreement. Directories outside '
+                '/var/lib/orata need a service ReadWritePaths change.</li></ol>'
+                '<p class="hint">3434 during a live call explicitly records a conversation '
+                'clip. Obtain consent where required.</p></div></div>')
+    body.append('<div class="card"><h2>Advanced phone settings</h2><div class="body">'
+                '<p>Trunk credentials, NAT and device passwords: '
+                '<span class="mono">%s</span>; see <a href="/devices">Devices</a> and '
+                '<a href="/setup">Setup</a>. Reload after editing, but do not change '
+                'working NAT settings without a reason.</p>'
+                '<p>Ring group, strict gate policy and <span class="mono">CLIPDIR</span>: '
+                '<span class="mono">/etc/asterisk/extensions.conf</span>. CLIPDIR must match '
+                'ORATA_CLIP_DIR. Reload the dialplan after editing.</p>'
+                '<p>Voicemail PIN: <span class="mono">/etc/asterisk/voicemail.conf</span>. '
+                'Replace the shipped PIN. Keep SIP and this UI off the public internet; '
+                'use WireGuard for remote access.</p></div></div>' % esc(PJSIP_CONF))
+    return render("/configure", "orata - configure", "".join(body), flash_of(request))
+
+
+# =====================================================================
 # books
 # =====================================================================
 
 def render_book(family, heading, add_cmd, del_cmd, val_label, note):
     rows = db_show(family)
-    out = ['<div class="card"><h2>%s<span class="note">%s</span></h2>'
-           % (esc(heading), esc(note))]
+    out = ['<div class="card" id="%s"><h2>%s%s</h2>'
+           '<div class="body tight"><p class="hint">%s</p></div>'
+           % (esc(family), esc(heading), help_tip(note), esc(note))]
     if rows:
         out.append('<div class="body flush"><table><thead><tr><th>Number</th>')
         if val_label:
@@ -511,26 +746,23 @@ def render_book(family, heading, add_cmd, del_cmd, val_label, note):
         out.append('<div class="empty">no entries</div>')
     out.append('<form class="add" method="post" action="/add">'
                '<input type="hidden" name="family" value="%s">'
+               '<label class="field">Caller number'
                '<input class="in mono" name="number" placeholder="15551234567" '
-               'size="15" required>' % esc(family))
+               'title="Use the exact caller ID digits from the log, normally 11 digits including 1." '
+               'inputmode="tel" size="15" required></label>' % esc(family))
     if val_label:
-        out.append('<input class="in" name="value" placeholder="%s" size="18" required>'
-                   % esc(val_label))
+        out.append('<label class="field">%s'
+                   '<input class="in" name="value" placeholder="%s" size="18" required>'
+                   '</label>' % (esc(val_label), esc(val_label)))
     out.append('<button class="btn primary" type="submit">add</button></form></div>')
     return "".join(out)
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/books", response_class=HTMLResponse)
 def page_books(request: Request, _=Depends(require_auth)):
-    # token arrived in the query string -> stash it in a cookie, clean the URL
-    if request.query_params.get("token"):
-        r = RedirectResponse("/", status_code=303)
-        r.set_cookie("orata_token", TOKEN, max_age=2592000, httponly=True,
-                     samesite="strict", path="/")
-        return r
     up, _v = asterisk_up()
     body = ["<h1>Call books</h1>",
-            '<p class="lede">Four key/value books in astdb. Every write goes through '
+            '<p class="lede">Five key/value books in astdb. Every write goes through '
             '<span class="mono">orata-cnam.sh</span>, so the CLI stays authoritative. '
             'Enter numbers exactly as voip.ms presents them &mdash; usually 11 digits, '
             '<span class="mono">15551234567</span>.</p>']
@@ -545,7 +777,7 @@ def page_books(request: Request, _=Depends(require_auth)):
                         '%s. Names added here will not be spoken until calls arrive. '
                         '<a href="/setup">Open Setup</a>.</div>' % esc(pending))
     body += [render_book(*b) for b in BOOKS]
-    return render("/", "orata - books", "".join(body), flash_of(request))
+    return render("/books", "orata - books", "".join(body), flash_of(request))
 
 
 @app.post("/add")
@@ -745,8 +977,22 @@ def diag_announce():
         arc = acfg.get("ORATA_ARC", "/usr/local/bin/alexa_remote_control.sh")
         out.append(chk("pass", "alexa_remote_control.sh", arc) if os.access(arc, os.X_OK)
                    else chk("warn", "alexa_remote_control.sh", "not executable: " + arc,
-                            "Announcements log 'alexa SKIP'. Fetch it, then "
-                            "sudo -u asterisk %s -a" % arc))
+                            "Install the reviewed upstream script; see docs/alexa-arc.md."))
+        out.append(chk("pass", "ARC jq dependency", "jq installed") if shutil.which("jq")
+                   else chk("warn", "ARC jq dependency", "jq missing",
+                            "sudo apt install jq"))
+        out.append(chk("info", "ARC refresh token", "present; authentication not tested")
+                   if acfg.get("REFRESH_TOKEN") else
+                   chk("warn", "ARC refresh token", "not set in announce.conf",
+                       "Obtain via alexa-cookie-cli, then export REFRESH_TOKEN in the "
+                       "protected live config. Do not put it in the repo or UI."))
+        cmd = acfg.get("ORATA_ALEXA_CMD", "speak")
+        out.append(chk("pass", "ARC speech command", "speak") if cmd == "speak"
+                   else chk("warn", "ARC speech command", cmd,
+                            "Current upstream rejects announce; set ORATA_ALEXA_CMD=speak."))
+        out.append(chk("info", "ARC authentication check", "not performed",
+                       "Source announce.conf as asterisk, run ARC -login, then -a to "
+                       "list devices. -l logs out. No Amazon requests are made here."))
     if mode in ("sensor", "both"):
         have = all(acfg.get(k) for k in ("ORATA_LWA_CLIENT_ID", "ORATA_LWA_CLIENT_SECRET",
                                          "ORATA_LWA_REFRESH_TOKEN"))
@@ -780,6 +1026,7 @@ def diag_announce():
         out.append(chk("warn" if fails else "pass", "announce.log",
                        "%d bytes, %d line(s), %d FAIL" % (size, len(tail), fails),
                        "Check the Log tab." if fails else ""))
+    out.extend(media_checks())
     return out
 
 
@@ -814,6 +1061,15 @@ def diag_media():
                chk("warn", "3434 in-call record", "recordclip not in the feature map",
                    "Pressing 3434 mid-call does nothing. cp asterisk/features.conf "
                    "to /etc/asterisk/ and run: asterisk -rx 'module reload features'"))
+    clipdir = globals_map().get("CLIPDIR")
+    if clipdir and os.path.normpath(clipdir) != os.path.normpath(CLIP_DIR):
+        out.append(chk("fail", "Recording directory agreement",
+                       "dialplan CLIPDIR=%s; web CLIP_DIR=%s" % (clipdir, CLIP_DIR),
+                       "Match CLIPDIR in extensions.conf to ORATA_CLIP_DIR in announce.conf; "
+                       "remove a conflicting web.conf override, then reload/restart."))
+    out.append(chk("pass", "orata-clip.sh", CLIP_SH) if os.access(CLIP_SH, os.X_OK)
+               else chk("fail", "orata-clip.sh", "not executable: " + CLIP_SH,
+                        "Install bin/orata-clip.sh to /usr/local/bin with mode 755."))
     nrec = len([n for n in (os.listdir(CLIP_DIR) if os.path.isdir(CLIP_DIR) else [])
                 if n.startswith("name-") and n.endswith(".wav")])
     out.append(chk("info", "recorded caller names", "%d" % nrec))
@@ -883,6 +1139,7 @@ def simulate(number):
     blocked = db_get("block", number) == "1"
     cnam = db_get("cnam", number)
     allowed = db_get("allow", number) == "1"
+    owner = db_get("owner", number) == "1"
     sensor = db_get("alexasensor", number)
     steps = []
 
@@ -905,17 +1162,20 @@ def simulate(number):
          "carrier CNAM is unknowable from here -- assumed empty")
     step(bool(sensor), "Set(ASENSOR=DB(alexasensor/%s))" % number,
          "alexasensor/%s = %s" % (number, sensor or "(unset)"))
-    step(allowed, "GotoIf(DB(allow/%s) = 1) &rarr; ring" % number,
-         "allow/%s = %s" % (number, db_get("allow", number) or "(unset)"))
-    gated = not allowed
-    if not allowed:
-        step(bool(cnam), 'GotoIf(CNAM != "") &rarr; ring',
-             "name book hit" if cnam else "no name resolved")
-        gated = not cnam
+    step(owner, "GotoIf(DB(owner/%s) = 1) &rarr; gate" % number,
+         "owner/%s = %s" % (number, "1" if owner else "(unset)"))
+    gated = owner or not (allowed or cnam)
+    if not owner:
+        step(allowed, "GotoIf(DB(allow/%s) = 1) &rarr; ring" % number,
+             "allow/%s = %s" % (number, db_get("allow", number) or "(unset)"))
+        if not allowed:
+            step(bool(cnam), 'GotoIf(CNAM != "") &rarr; ring',
+                 "name book hit" if cnam else "no name resolved")
 
     if gated:
-        step(strict, "GotoIf(STRICT = 1) &rarr; reject", "STRICT=%s" % g.get("STRICT", "0"))
-        if strict:
+        if not owner:
+            step(strict, "GotoIf(STRICT = 1) &rarr; reject", "STRICT=%s" % g.get("STRICT", "0"))
+        if strict and not owner:
             step(True, "Playback(vm-goodbye) &rarr; Hangup()")
             return steps, ("REJECTED",
                            "STRICT mode is on, so an unknown caller is dropped without "
@@ -942,9 +1202,14 @@ def simulate(number):
               "<br>Alexa mode: <span class=\"mono\">%s</span>"
               % (esc(phrase), esc(ep or "(none, and no ORATA_SENSOR_DEFAULT)"),
                  esc(acfg.get("ORATA_ALEXA_MODE", "arc"))))
-    if gated:
+    if owner:
+        step(True, "3434 &rarr; orata-record",
+             "owner-only alternative: record, save, broadcast, repeat until hangup")
+        detail = ("Owner &mdash; press 1 to ring normally, or 3434 to record and broadcast. "
+                  "Owner gate bypasses STRICT.<br>" + detail)
+    elif gated:
         detail = "Unknown caller &mdash; must press 1 within 7s first.<br>" + detail
-    return steps, ("GATE then RING" if gated else "RING", detail)
+    return steps, ("OWNER GATE" if owner else ("GATE then RING" if gated else "RING"), detail)
 
 
 def render_sim(number):
@@ -1094,8 +1359,9 @@ def harness_body(raw_sim, result_html):
         '<button class="btn primary" type="submit">run astdb round-trip</button></form>'
         '<span class="hint" style="margin:0;flex:1;min-width:16rem">Writes probe key '
         '<span class="mono">' + esc(PROBE_NUM) + "</span> to all four books, reads each "
-        'back through <span class="mono">dialplan eval</span>, then deletes it. Proves '
-        "orata-cnam.sh and extensions.conf agree on key names. Self-cleaning.</span></div>"
+        'back through <span class="mono">database get</span>, then deletes it. Proves '
+        "CLI-to-astdb writes only; use live channel probes for dialplan reads. "
+        "Self-cleaning.</span></div>"
 
         '<div class="row" style="align-items:flex-start;margin-bottom:1rem">'
         '<form class="row" method="post" action="/harness/announce">'
@@ -1319,12 +1585,16 @@ def setup_body():
     mode = acfg.get("ORATA_ALEXA_MODE", "arc")
     ip = lan_ip()
 
-    done_creds = not stubs
+    done_creds = pjsip_live_text() is not None and not stubs
     done_reg = reg == "Registered"
     done_dev = bool(contacts)
-    done_alexa = (mode == "off") or arc_ok or (mode in ("sensor", "both") and all(
-        acfg.get(k) for k in ("ORATA_LWA_CLIENT_ID", "ORATA_LWA_CLIENT_SECRET",
-                              "ORATA_LWA_REFRESH_TOKEN")))
+    arc_ready = (arc_ok and bool(shutil.which("jq")) and bool(acfg.get("REFRESH_TOKEN"))
+                 and acfg.get("ORATA_ALEXA_CMD", "speak") == "speak")
+    sensor_ready = all(acfg.get(k) for k in (
+        "ORATA_LWA_CLIENT_ID", "ORATA_LWA_CLIENT_SECRET", "ORATA_LWA_REFRESH_TOKEN"))
+    # Configuration readiness only, not proof of valid auth or audible speech.
+    done_alexa = {"off": True, "arc": arc_ready, "sensor": sensor_ready,
+                  "both": arc_ready and sensor_ready}.get(mode, False)
 
     # exactly one step is "now" -- the first unfinished one. The name book is
     # "done" once it has any entry; it is never really finished, but an empty
@@ -1448,13 +1718,13 @@ def setup_body():
 
     # ---- step 4 : the books -----------------------------------------
     out.append(scard(
-        "4", "Load the name book", "now" if first == 3 else "todo",
+        "4", "Load the name book", st(3, done_books),
         '<p>A number in the <b>Name book</b> gets its name spoken and skips the '
         'robocall gate. Everyone else is asked to press 1, once, and is remembered '
         'after that.</p>'
         '<ul>'
         '<li>Add family and anyone who must never be gated &mdash; '
-        '<a href="/">Books</a> tab.</li>'
+        '<a href="/books">Books</a> tab.</li>'
         '<li>Enter numbers <b>exactly as voip.ms presents them</b>, normally 11 '
         'digits: <span class="mono">15551234567</span>. The wrong format fails '
         'silently.</li>'
@@ -1481,18 +1751,30 @@ def setup_body():
         '<span class="mono">https://ntfy.sh/</span> plus a long unguessable topic. '
         'It never breaks, and it is what still works when Amazon auth rots. Public '
         'topics are readable by anyone who guesses the name.</p>'
-        '<p><b>Then Alexa.</b> Fetch '
-        '<span class="mono">alexa_remote_control.sh</span>, install it to '
-        '<span class="mono">%s</span>, then authenticate <b>as the asterisk '
-        'user</b> or the cookie lands in the wrong home directory:</p>'
-        '<pre class="cmd">sudo -u asterisk %s -a</pre>'
-        '<p>That starts a proxy on port 5601; log in to Amazon from a LAN browser. '
-        'Verify with the <b>fire announcement</b> button on '
-        '<a href="/harness">Harness</a>, then dial <span class="mono">*99</span>.</p>'
-        '<p class="hint">Two Alexa traps: Do Not Disturb suppresses announcements '
-        'entirely, and announcement volume follows device volume &mdash; an overnight '
-        'volume routine makes calls inaudible.</p>'
-        % (esc(ANNOUNCE_CONF), esc(ANNOUNCE_CONF), alexa_rows, esc(arc), esc(arc))))
+        '<p><b>Then Alexa (ARC mode).</b> Install jq and the reviewed upstream '
+        '<span class="mono">alexa_remote_control.sh</span> to '
+        '<span class="mono">%s</span>. Obtain an Alexa app refresh token using '
+        '<a href="https://github.com/adn77/alexa-cookie-cli">alexa-cookie-cli</a>, '
+        'a separate login helper. Bind its proxy to localhost; never expose it '
+        'to the internet.</p>'
+        '<p>In the protected live announce.conf, set '
+        '<span class="mono">ORATA_ALEXA_CMD=speak</span> and export '
+        '<span class="mono">REFRESH_TOKEN</span>, <span class="mono">AMAZON</span>, '
+        '<span class="mono">ALEXA</span>, <span class="mono">TTS_LOCALE</span> and '
+        '<span class="mono">TMP</span>. Use your account region and a private '
+        'asterisk-writable TMP directory. See <span class="mono">docs/alexa-arc.md</span> '
+        'for commands. LWA credentials are for the separate sensor route.</p>'
+        '<p>Source that config <b>as asterisk</b>, run ARC '
+        '<span class="mono">-login</span>, then <span class="mono">-a</span> to list '
+        'devices. <b>-l logs out</b>; ARC itself does not start a login proxy. '
+        'Current upstream rejects <span class="mono">announce:</span>.</p>'
+        '<p>Test one Echo with the <b>fire announcement</b> button on '
+        '<a href="/harness">Harness</a>, then dial <span class="mono">*99</span>. '
+        'These send real traffic. No reload is needed for announce.conf changes.</p>'
+        '<p class="hint">Step completion means settings are present, not validated '
+        'authentication or audible speech. Do Not Disturb and low volume can '
+        'suppress playback; upstream returning success is not proof.</p>'
+        % (esc(ANNOUNCE_CONF), esc(ANNOUNCE_CONF), alexa_rows, esc(arc))))
 
     # ---- housekeeping ------------------------------------------------
     out.append('<div class="card"><h2>Before you call it done</h2><div class="body">'
@@ -1778,7 +2060,7 @@ def page_devices(request: Request, _=Depends(require_auth)):
 # orata-announce.sh renders every phrase to a WAV under AUDIO_DIR. This
 # serves them back so you can hear what was announced without standing
 # next to an Echo. Playback here is NOT evidence Amazon spoke anything --
-# only the "alexa OK" log line is that.
+# even an "alexa OK" log line only confirms the API command succeeded.
 # =====================================================================
 
 # The sole trusted shape. Anything else is refused rather than sanitised.
@@ -1787,7 +2069,7 @@ AUDIO_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9]{3,15}\.wav$")
 
 def audio_name_in(line):
     """Pull a servable recording name out of an 'audio OK <path>' log line."""
-    m = re.search(r"audio OK\s+(\S+\.wav)", line)
+    m = re.search(r"audio OK\s+(?:[0-9]+\s+)?(\S+\.wav)", line)
     if not m:
         return ""
     name = os.path.basename(m.group(1))
@@ -1869,7 +2151,8 @@ def page_audio(request: Request, _=Depends(require_auth)):
         body.append('<p class="hint">Older files are deleted automatically by '
                     '<span class="mono">orata-announce.sh</span> &mdash; see '
                     '<span class="mono">ORATA_AUDIO_KEEP</span>. Nothing here is '
-                    "call audio; no conversation is ever recorded.</p>")
+                    "conversation audio unless you explicitly capture a clip with "
+                    "<span class=\"mono\">3434</span>.</p>")
     body.append(prompts_card())
     body.append(names_card())
     body.append(clips_card())
@@ -1899,6 +2182,8 @@ CLIP_ROLES = [
      "Press 1 to replay, 2 to save, 3 to re-record, or star to cancel."),
     ("rec-saved", "*96 saved", "Confirmation after a clip is saved.",
      "Saved."),
+    ("call-from", "Caller name lead-in", "Spliced before recorded caller names in local audio.",
+     "Call from"),
 ]
 
 
@@ -1913,7 +2198,7 @@ def clip_label(stem):
 def role_source(role):
     try:
         with open(os.path.join(CLIP_DIR, "role-%s.txt" % role)) as fh:
-            return fh.read().strip()[:40]
+            return fh.read().strip()[:200]
     except OSError:
         return ""
 
@@ -1963,8 +2248,8 @@ def prompts_card():
            '<p class="hint" style="margin-top:0">Type the words and press '
            '<b>synthesise</b> for a robot voice, or record one by dialling '
            '<span class="mono">*96</span> and assign it below. Unset prompts fall '
-           "back to the sound files installed with the project, so clearing one can "
-           "never leave a caller in silence.</p>"]
+           "back to installed sound files. Check Diagnostics before resetting: "
+           "a missing built-in prompt will be silent.</p>"]
     for role, title, blurb, suggested in CLIP_ROLES:
         inst = role_installed(role)
         src = role_source(role) if inst else ""
@@ -2037,7 +2322,7 @@ def names_card():
            "espeak phrase. This is for the local render and the handsets.</p>"]
     if not book:
         out.append('<div class="empty">the name book is empty &mdash; '
-                   'add someone on the <a href="/">Books</a> tab first</div>')
+                   'add someone on the <a href="/books">Books</a> tab first</div>')
     for num, name in book:
         rec = name_recorded(num)
         src = name_source(num)
@@ -2131,7 +2416,7 @@ def clips_card():
             'style="margin-right:.4rem"><input type="hidden" name="role" value="%s">'
             '<input type="hidden" name="name" value="%s">'
             '<button class="btn" type="submit">use as %s</button></form>'
-            % (esc(r), esc(stem), esc(t.lower())) for r, t, _b in CLIP_ROLES)
+            % (esc(r), esc(stem), esc(t.lower())) for r, t, _b, _suggested in CLIP_ROLES)
         out.append(
             '<div style="border-top:1px solid #222;padding:.75rem 0">'
             '<div class="row" style="align-items:center">'

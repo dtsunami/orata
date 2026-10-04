@@ -76,49 +76,39 @@ You want to see `Registered`.
 
 ## Alexa setup
 
-Fetch the script:
+See **[docs/alexa-arc.md](docs/alexa-arc.md)** for the current dynamic-speech
+setup. Install `jq` and the reviewed third-party `alexa_remote_control.sh`,
+obtain an Alexa app refresh token with the separate `alexa-cookie-cli`
+helper, then export the token, region settings and private cookie path from
+your existing `/etc/orata/announce.conf`.
 
-    sudo curl -fsSL -o /usr/local/bin/alexa_remote_control.sh \
-      https://raw.githubusercontent.com/thorsten-gehrig/alexa-remote-control/master/alexa_remote_control.sh
-    sudo chmod 755 /usr/local/bin/alexa_remote_control.sh
+Important corrections to older instructions:
 
-Read it before you run it. It is a third-party script that will hold a
-credential for your Amazon account.
+- Current upstream uses **`speak:`**, not `announce:`. Set `ORATA_ALEXA_CMD=speak`.
+- **`-a` lists devices; `-l` logs out; `-login` exchanges the refresh token.**
+  The remote-control script does not start a browser-login proxy.
+- Run as `asterisk` after sourcing announce.conf; direct invocations otherwise
+  miss the exported token and region settings.
+- Never commit the token or paste it into chat. The sensor route's
+  `ORATA_LWA_*` values are separate credentials.
+- No dialplan reload is needed for changes to announce.conf.
+- Do Not Disturb and low Echo volume can suppress speech. `alexa OK` only
+  means upstream returned success; listen to confirm playback.
 
-Set your Amazon domain near the top of that script (`amazon.com` /
-`amazon.ca` / `amazon.co.uk`), then authenticate:
-
-    sudo -u asterisk /usr/local/bin/alexa_remote_control.sh -a
-
-This starts a local proxy on port 5601. Browse to `http://<pi-ip>:5601` from a
-machine on your LAN, log in to Amazon there, and the script captures the
-session cookie to `~asterisk/.alexa.cookie`. Run it as the `asterisk` user —
-if you authenticate as root, Asterisk won't find the cookie.
-
-Confirm devices are visible, then test:
-
-    sudo -u asterisk /usr/local/bin/alexa_remote_control.sh -d ALL -e "announce:test"
-
-List exact device names with `-l` and put them in `announce.conf` if `ALL` is
-too broad.
-
-**When it stops working** the symptom is `alexa FAIL` lines in
-`/var/log/orata/announce.log`. Fix is re-running `-a`. That is the entire
-maintenance burden.
-
-### Two things that will confuse you
-
-- **Do Not Disturb on an Echo suppresses announcements.** Useful at night,
-  baffling at 2pm if you forgot it's on.
-- **Announcement volume follows device volume**, and Echos drop their volume
-  overnight if you have a routine doing that.
+The instructions were checked against upstream source on 2026-10-04.
+Authentication and audible playback still require testing on your account.
 
 ## Web UI
 
-Optional. A FastAPI app (`orata_web.py`) that edits the name book, whitelist,
-blocklist and Alexa sensor map from a browser, and carries a diagnostics page,
-a test harness and an audio tab. It shells out to `orata-cnam.sh`, so the CLI
-stays authoritative and nothing is generated or overwritten.
+Optional. A FastAPI app (`orata_web.py`) with a **Dashboard** landing page
+for phone status, handsets, storage and recent activity. **Configure** guides
+users through setup, caller policy, prompts and announcement settings with
+help popovers and instructions. **Books** edits names, announcement owners,
+whitelist, blocklist and Alexa sensor maps. Diagnostics, a test harness and
+an Audio tab provide verification.
+
+Caller edits use `orata-cnam.sh`; voice prompts and clips use `orata-clip.sh`.
+The CLI remains authoritative. System config files stay hand-edited.
 
 The **Audio** tab plays back announcements. `orata-announce.sh` renders every
 phrase to a WAV on the Pi (`apt install espeak-ng`) before it calls out, so
@@ -126,10 +116,11 @@ you can hear what was announced without an Echo in earshot. Useful well before
 Alexa is set up at all — it is how you confirm the name book resolved and the
 phrase came out right.
 
-It proves the phrase, **not** the announcement. Only `alexa OK` in
-`announce.log` proves Amazon spoke anything. No call audio is ever recorded;
-these are synthesised renders of text the Pi composed, kept in a ring buffer
-(`ORATA_AUDIO_KEEP`, default 50).
+It proves the phrase, **not** audible Echo playback. `alexa OK` means the
+API command succeeded; Do Not Disturb or volume can still suppress speech.
+Local renders do not record conversations and are kept in a ring buffer
+(`ORATA_AUDIO_KEEP`, default 50). Handset recording is separate and explicit:
+`*96` or `3434`, described below.
 
 This is the one place the project takes a framework dependency. It is
 installed from Debian packages, not pip — trixie's python3 is

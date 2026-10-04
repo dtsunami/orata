@@ -26,7 +26,8 @@
 #
 set -u
 
-[ -r /etc/orata/announce.conf ] && . /etc/orata/announce.conf
+CONF="${ORATA_ANNOUNCE_CONF:-/etc/orata/announce.conf}"
+[ -r "$CONF" ] && . "$CONF"
 
 CLIP_DIR="${ORATA_CLIP_DIR:-/var/lib/orata/clips}"
 TMP_DIR="${CLIP_DIR}/tmp"
@@ -72,7 +73,8 @@ check_role() {
 }
 
 prune() {
-    ls -1t "$CLIP_DIR"/*.wav 2>/dev/null | tail -n +$((KEEP + 1)) \
+    # Only library clips are disposable. Never prune role-* or name-*.
+    ls -1t "$CLIP_DIR"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].wav 2>/dev/null | tail -n +$((KEEP + 1)) \
         | while IFS= read -r old; do
               rm -f "$old" "${old%.wav}.txt"
           done
@@ -91,7 +93,8 @@ init)
 commit)
     src="${1:-}"
     [ -n "$src" ] || die "commit needs a path"
-    [ -s "$src" ] || { log "clip FAIL empty or missing ${src}"; die "empty recording: $src"; }
+    [ -s "$src" ] && [ "$(stat -c %s "$src" 2>/dev/null)" -gt 44 ] \
+        || { log "clip FAIL empty or missing ${src}"; die "empty recording: $src"; }
     st="$(stem_of "$src")"
     check_stem "$st"
     mkdir -p "$CLIP_DIR" 2>/dev/null
@@ -176,7 +179,7 @@ say)
         die "$tts could not synthesise"
     fi
     # 8 kHz 16-bit mono, or Asterisk plays it at the wrong pitch.
-    if ! sox "$raw" -r 8000 -c 1 -b 16 "${out}.new" >/dev/null 2>&1; then
+    if ! sox "$raw" -r 8000 -c 1 -b 16 -t wav "${out}.new" >/dev/null 2>&1; then
         rm -f "$raw" "${out}.new"
         die "sox could not resample to 8 kHz"
     fi
@@ -239,7 +242,7 @@ name-set|name-say|name-del)
         timeout 15 "$tts" -w "$raw" "$txt" >/dev/null 2>&1 && [ -s "$raw" ] \
             || { rm -f "$raw"; die "$tts could not synthesise"; }
         # Must match Record()'s 8 kHz mono or the concat in announce.sh fails.
-        sox "$raw" -r 8000 -c 1 -b 16 "${out}.new" >/dev/null 2>&1 \
+        sox "$raw" -r 8000 -c 1 -b 16 -t wav "${out}.new" >/dev/null 2>&1 \
             || { rm -f "$raw" "${out}.new"; die "sox could not resample"; }
         rm -f "$raw"
         mv -f "${out}.new" "$out"

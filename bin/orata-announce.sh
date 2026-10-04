@@ -13,7 +13,8 @@ NUM="${1:-unknown}"
 NAME="${2:-}"
 SENSOR="${3:-}"
 
-[ -r /etc/orata/announce.conf ] && . /etc/orata/announce.conf
+CONF="${ORATA_ANNOUNCE_CONF:-/etc/orata/announce.conf}"
+[ -r "$CONF" ] && . "$CONF"
 
 ARC="${ORATA_ARC:-/usr/local/bin/alexa_remote_control.sh}"
 AUDIO_DIR="${ORATA_AUDIO_DIR:-/var/lib/orata/announce}"
@@ -22,7 +23,7 @@ CLIP_DIR="${ORATA_CLIP_DIR:-/var/lib/orata/clips}"
 RECORD_AUDIO="${ORATA_RECORD_AUDIO:-1}"
 TTS="${ORATA_TTS:-}"
 DEVICES="${ORATA_ALEXA_DEVICES:-ALL}"
-ALEXA_CMD="${ORATA_ALEXA_CMD:-announce}"
+ALEXA_CMD="${ORATA_ALEXA_CMD:-speak}"
 NTFY_URL="${ORATA_NTFY_URL:-}"
 SPEAK_DIGITS="${ORATA_SPEAK_DIGITS:-0}"
 LOG="${ORATA_LOG:-/var/log/orata/announce.log}"
@@ -48,8 +49,8 @@ fi
 # credentials, nothing to expire. Runs first so a recording exists even
 # if every remote channel hangs. Never fails the script.
 #
-# This proves what was SAID, not that Amazon spoke it. For that, read the
-# "alexa OK" line.
+# This proves the composed phrase, not Echo playback. Even "alexa OK"
+# only means the third-party script returned success.
 announce_audio() {
     [ "$RECORD_AUDIO" = "1" ] || return 0
 
@@ -89,7 +90,7 @@ announce_audio() {
         # what Asterisk's Record() produces, or sox refuses to concatenate.
         if [ ! -s "$prefix" ]; then
             if timeout 10 "$tts" -w "${prefix}.raw" "Call from" >/dev/null 2>&1 \
-               && sox "${prefix}.raw" -r 8000 -c 1 -b 16 "${prefix}.new" \
+               && sox -t wav "${prefix}.raw" -r 8000 -c 1 -b 16 -t wav "${prefix}.new" \
                     >/dev/null 2>&1; then
                 mv -f "${prefix}.new" "$prefix"
             fi
@@ -138,7 +139,7 @@ announce_arc() {
         if timeout 20 "$ARC" -d "$DEVICES" -e "${ALEXA_CMD}:${PHRASE}" >/dev/null 2>&1; then
             log "alexa OK   ${NUM} \"${PHRASE}\""
         else
-            log "alexa FAIL ${NUM} -- cookie expired? re-run: sudo -u asterisk ${ARC} -a"
+            log "alexa FAIL ${NUM} -- check ARC refresh token, region, jq and command; see docs/alexa-arc.md"
         fi
     else
         log "alexa SKIP ${NUM} -- ${ARC} not executable"

@@ -1,6 +1,6 @@
 # test/ — verification rigs
 
-Two things live here now:
+Three verification paths live here:
 
 - **`selftest.conf`** — a dialplan context deployed *on the Pi* that drives
   the real inbound paths with a spoofed caller ID. This is what actually
@@ -13,6 +13,24 @@ Two things live here now:
 
 **Neither is a deployment target.** HANDOFF rejects Docker for running
 orata; that decision stands.
+
+## Isolated web/audio regressions
+
+`regression.py` uses unittest, the installed FastAPI/Starlette dependencies,
+mocked Asterisk CLI responses and disposable directories under `test/`.
+It never calls the live CLI or sends SIP, ntfy or Alexa traffic:
+
+    python3 test/regression.py
+
+Covers the dashboard/configuration routes, caller books, authentication,
+Audio rendering with saved clips, playback links, assigned-prompt retention,
+prompt readback, and recording commit failures. With espeak-ng/espeak and
+sox installed, it also synthesises real 8 kHz WAVs and concatenates a
+recorded-name announcement; otherwise that test is explicitly skipped.
+
+The owner hangup-save checks are structural only. Test real recordings,
+disconnects and broadcasts on the Pi after deployment. Visual browser review
+is also separate.
 
 ## On-Pi selftest
 

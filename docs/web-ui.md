@@ -1,12 +1,14 @@
 # Web UI
 
-`bin/orata_web.py` — a FastAPI app that edits the four astdb books through a
-browser, plus a read-only diagnostics page and a test harness.
+`bin/orata_web.py` — a FastAPI app with a status dashboard, guided configuration,
+five astdb caller books, editable voice prompts, recordings, diagnostics and
+a test harness. No frontend build system or additional runtime dependencies.
 
 Installed from Debian packages (`python3-fastapi`, `python3-uvicorn`). No pip,
 no venv, no database.
 
-**Unverified.** Never run on the Pi.
+The current source has isolated regression coverage (`python3 test/regression.py`).
+Browser layout and real handset recording/hangup behavior still need on-Pi checks.
 
 ## The tension, stated up front
 
@@ -107,9 +109,10 @@ URL, so this only bites tokens created by hand or by an older installer.
 
 ## What the UI deliberately will not do
 
-It never writes a config file. Every mutation goes through
-`orata-cnam.sh` into astdb. This is the line between orata-web and FreePBX,
-which HANDOFF rejected for owning the configs and fighting hand-editing.
+It never writes a config file. Caller-book mutations go through `orata-cnam.sh`
+into astdb; voice clip and prompt mutations go through `orata-clip.sh`.
+This is the line between orata-web and FreePBX, which HANDOFF rejected for
+owning the configs and fighting hand-editing.
 
 So these stay hand-edited, and no amount of UI polish should absorb them:
 
@@ -124,11 +127,29 @@ The Diagnostics tab *detects and reports* every one of these — stubbed
 credentials, missing ntfy URL, selftest context not loaded — and tells you
 which file to edit. Reporting is the boundary.
 
-## The Setup tab
+## Dashboard and Configure
 
-`/setup` is the first tab and the intended landing page after install. It is a
-six-step walkthrough that reads live state and marks each step done / do this
-now / waiting — exactly one step is ever "do this now". Reload after changing
+`/` is the landing page after the token is exchanged for a cookie. It shows
+Asterisk reachability, trunk registration, available handset contacts, Alexa
+mode, recent failures, audio counts, free space, recording-directory access
+and recent log activity. All probes are read-only; refresh to re-run them.
+Registration is not proof of DID routing or two-way audio.
+
+`/configure` provides ordered entry points for setup, caller policy, prompts
+and testing, plus current announcement settings and instructions explaining
+each option. Help popovers work by touch or keyboard. Private ntfy URLs and
+LWA credentials are not displayed.
+
+Caller books and prompts are browser-editable. Trunk credentials, Alexa/ntfy
+settings, voicemail and dialplan globals remain file-managed. Announcement
+scripts read their config on each invocation; restart the web service after
+changing audio directories because it resolves those paths at startup.
+
+## Setup walkthrough
+
+`/setup`, linked from Configure and the dashboard, is the checked first-run
+walkthrough. It reads live state and marks steps done / do this now / waiting.
+Portal actions cannot be verified automatically. Reload after changing
 something and it re-evaluates.
 
 | Step | Detected by |
@@ -153,17 +174,18 @@ trunk is unregistered.
 
 ## What it manages
 
-Four books, all live in astdb. Edits apply to the **next call** — no reload.
+Five books at `/books`, all live in astdb. Edits apply to the **next call** — no reload.
 
 | Book | Meaning |
 |---|---|
-| `cnam` | spoken name. Present = skips the robocall gate. |
+| `cnam` | spoken name. Skips the robocall gate unless also an owner. |
+| `owner` | may enter 3434 at the inbound gate to record/broadcast; always hears the gate. Caller ID is spoofable, so this is not strong authentication. |
 | `allow` | whitelist. Past the gate, permanently. |
 | `block` | hung up on immediately. Never rings, never announces. |
 | `alexasensor` | per-number Alexa sensor endpointId (path B only) |
 
-Plus the last 40 lines of `announce.log`, which is where `alexa FAIL` and
-`sensor FAIL` show up.
+Plus the last 200 lines of `announce.log`, where notification and recording
+failures show up. Prompt, clip and caller-name mutations use `orata-clip.sh`.
 
 ## Whitelist, gate, blocklist — how they interact
 
@@ -263,16 +285,71 @@ fail in a way that looks like a TTS problem.
 
 ### Why this is safe to leave on
 
-No call audio is recorded, ever. These are synthesised renders of a phrase
-the Pi composed itself — the same text sent to Amazon. The only information
-in them is the caller's name and number, which is already in astdb and
-already in the log.
+Local announcement rendering does not record conversations. It synthesises
+the same caller phrase sent to Amazon, optionally using a recorded name.
+Handset clips are separate: `*96`, owner-mode `3434`, and in-call `3434`
+explicitly capture voice. In-call capture may record another party; obtain
+consent where required.
 
 Serving them is the one place the UI returns a file from disk, so the
 filename handling is deliberately rigid: names must match
 `^\d{8}-\d{6}-\d{3,15}\.wav$`, are basenamed before matching, and anything
 else is refused rather than sanitised. Nothing the user types is ever joined
 to a path.
+
+## Recording regression fixes and updating an existing install
+
+The symptom:
+
+    clip OK   20261004-060014 119564 bytes
+    clip CAST 20261004-060014 -> 3/3 endpoint(s)
+    clip FAIL empty or missing /var/lib/orata/clips/tmp/20261004-060022.wav
+
+The first clip was saved. `CAST` counts dispatched Asterisk CLI commands,
+not handset answers or successful playback. The later failure refers to a
+different recording. The old owner loop armed its hangup commit before the
+next start prompt; disconnecting there could try to commit a file never
+recorded. The revised loop arms after the prompt and the hangup path checks
+file existence/size. Failed commits cannot broadcast or play a saved confirmation.
+
+Separately, the old Audio page crashed as soon as a saved clip existed:
+`clips_card()` unpacked four-field prompt definitions into three variables.
+That UI error did not mean the saved WAV was lost.
+
+Other fixes: explicit WAV formats for sox `.new`/`.raw` files, retention
+restricted to timestamped clips (never assigned prompts or caller names),
+full prompt text readback, and log playback links accepting the caller
+number emitted by the announcement script.
+
+From the repo root, update the binaries without replacing live settings:
+
+    sudo install -m 755 bin/orata_web.py bin/orata-clip.sh bin/orata-announce.sh /usr/local/bin/
+    sudo systemctl restart orata-web
+
+Review the `asterisk/extensions.conf` diff and merge the recorder changes
+into `/etc/asterisk/extensions.conf`, preserving local globals and includes.
+Do **not** blindly overwrite a customised dialplan. Then:
+
+    sudo asterisk -rx 'dialplan reload'
+
+Never replace your existing `announce.conf`, `web.conf` or `pjsip.conf`
+with the repo defaults to apply these fixes. The web installer updates only
+the web binary; it does not deploy clip/announcement scripts or the dialplan.
+
+Verify on a handset: save a `*96` clip and open Audio; enter owner announce
+mode, save and broadcast once, then hang up during the next start prompt;
+finally hang up mid-recording and confirm that only actual audio is saved.
+Check both `announce.log` and `journalctl -u orata-web`.
+
+Isolated regression checks (no live SIP, ntfy, Alexa or astdb writes):
+
+    python3 test/regression.py
+    bash -n bin/orata-clip.sh bin/orata-announce.sh
+    git diff --check
+
+Real synthesis coverage needs `espeak-ng` (or `espeak`) and `sox`; absent
+dependencies produce an explicit skip. Dialplan checks here are structural,
+not proof of runtime hangup handling. Browser appearance needs visual review.
 
 ## Known gaps
 
