@@ -36,6 +36,7 @@ class BridgeTests(unittest.TestCase):
         self.path.write_text(
             "[bridge]\nenabled=true\nacknowledge_spoofable_callback=true\n"
             "callback_caller_id=15551230002\ndestination=15551230003\n"
+            "callback_destination=15551230004\n"
             "allowed_callers=15551230001\nstate_dir=%s\n"
             "callback_window=30\ncall_limit=900\ncooldown=60\n"
             % (self.base / "state"))
@@ -55,14 +56,17 @@ class BridgeTests(unittest.TestCase):
                          ("NORMAL", None))
         self.cfg.enabled = False
         self.assertIsNone(self.store.reserve("15551230001", self.cfg.did, "original", now=100))
-        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.did, "echo", now=100),
-                         ("NORMAL", None))
+        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.callback_did, "echo", now=100),
+                         ("REJECT", None))
 
-    def test_config_requires_acknowledgement_and_distinct_exact_numbers(self):
+    def test_config_requires_acknowledgement_and_distinct_exact_dids(self):
         text = self.path.read_text()
         for bad in (
             text.replace("acknowledge_spoofable_callback=true", "acknowledge_spoofable_callback=false"),
-            text.replace("allowed_callers=15551230001", "allowed_callers=15551230002"),
+            text.replace("callback_destination=15551230004", "callback_destination=15551230003"),
+            text.replace("callback_destination=15551230004\n", ""),
+            text.replace("callback_destination=15551230004", "callback_destination=5551230003"),
+            text.replace("callback_destination=15551230004", "callback_destination=+15551230004"),
             text.replace("allowed_callers=15551230001", "allowed_callers=*"),
             text.replace("callback_window=30", "callback_window=600"),
         ):
@@ -71,41 +75,41 @@ class BridgeTests(unittest.TestCase):
                 bridge.Config(self.path)
 
     def test_callback_cannot_trigger_and_unmatched_callback_is_rejected(self):
-        self.assertIsNone(self.store.reserve(self.cfg.callback, self.cfg.did, "echo", now=100))
-        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.did, "echo", now=100),
+        self.assertIsNone(self.store.reserve(self.cfg.callback, self.cfg.callback_did, "echo", now=100))
+        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.callback_did, "echo", now=100),
                          ("REJECT", None))
 
     def test_destination_and_readiness_are_required(self):
         self.assertIsNone(self.store.reserve("15551230001", "other-did", "original", now=100))
         session = self.reserve(armed=False)
-        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.did, "echo", now=100),
+        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.callback_did, "echo", now=100),
                          ("REJECT", None))
         self.store.arm(session["token"], now=101)
         self.assertEqual(self.store.claim(self.cfg.callback, "other-did", "echo", now=102),
-                         ("REJECT", None))
+                         ("NORMAL", None))
 
     def test_one_original_and_one_callback(self):
         session = self.reserve()
         self.assertIsNone(self.store.reserve("15551230001", self.cfg.did, "second", now=102))
-        outcome, claimed = self.store.claim(self.cfg.callback, self.cfg.did, "echo", now=102)
+        outcome, claimed = self.store.claim(self.cfg.callback, self.cfg.callback_did, "echo", now=102)
         self.assertEqual(outcome, "CALLBACK")
         self.assertEqual(claimed["token"], session["token"])
-        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.did, "duplicate", now=103),
+        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.callback_did, "duplicate", now=103),
                          ("REJECT", None))
 
     def test_deadline_and_cancelled_callback_rejection(self):
         session = self.reserve()
-        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.did, "late", now=131),
+        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.callback_did, "late", now=131),
                          ("REJECT", None))
         self.store.stop(session["token"], "cancelled")
-        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.did, "echo", now=102),
+        self.assertEqual(self.store.claim(self.cfg.callback, self.cfg.callback_did, "echo", now=102),
                          ("REJECT", None))
 
     def test_simultaneous_callbacks_have_exactly_one_winner(self):
         self.reserve()
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(
-                lambda n: self.store.claim(self.cfg.callback, self.cfg.did, "echo-%d" % n, now=102),
+                lambda n: self.store.claim(self.cfg.callback, self.cfg.callback_did, "echo-%d" % n, now=102),
                 range(8)))
         self.assertEqual(sum(action == "CALLBACK" for action, _ in results), 1)
 
@@ -120,7 +124,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_connected_call_never_falls_back_after_departure(self):
         session = self.reserve()
-        self.store.claim(self.cfg.callback, self.cfg.did, "echo", now=102)
+        self.store.claim(self.cfg.callback, self.cfg.callback_did, "echo", now=102)
         self.store.connected(session["token"])
         stopped = self.store.stop(session["token"], "callback-hangup")
         self.assertEqual(stopped["phase"], "ended")
@@ -149,7 +153,7 @@ class BridgeTests(unittest.TestCase):
 
         def arm(token):
             result = bridge.Store.arm(self.store, token, now=101)
-            self.store.claim(self.cfg.callback, self.cfg.did, "echo", now=102)
+            self.store.claim(self.cfg.callback, self.cfg.callback_did, "echo", now=102)
             return result
 
         with mock.patch.object(self.store, "arm", side_effect=arm), \
@@ -197,6 +201,11 @@ class BridgeTests(unittest.TestCase):
 
     def invoke_agi(self, action, env, *args):
         """Exercise real main()/protocol/state, with all live effects mocked."""
+        env = dict(env)
+        if action == "route":
+            env.setdefault("agi_arg_2", self.cfg.callback_did)
+        elif action == "offer":
+            env.setdefault("agi_arg_3", self.cfg.callback_did)
         source = "".join("%s: %s\n" % item for item in env.items())
         source += "\n" + "200 result=1\n" * 16
         output = io.StringIO()
@@ -226,7 +235,7 @@ class BridgeTests(unittest.TestCase):
 
         self.store.arm(session["token"])
         output, spawn, cli = self.invoke_agi("route", {
-            "agi_extension": self.cfg.did, "agi_callerid": self.cfg.callback,
+            "agi_extension": self.cfg.callback_did, "agi_callerid": self.cfg.callback,
             "agi_channel": "PJSIP/echo",
         })
         self.assertIn('SET VARIABLE AB_ACTION "CALLBACK"', output)
@@ -241,6 +250,117 @@ class BridgeTests(unittest.TestCase):
         self.assertIn('SET VARIABLE AB_RESULT "CONNECTED"', output)
         self.assertEqual(self.store.snapshot(), {})
         self.assertTrue(any("confbridge kick" in call.args[0] for call in cli.call_args_list))
+
+    def test_same_cid_can_offer_on_main_and_claim_only_on_callback_did(self):
+        text = self.path.read_text().replace("allowed_callers=15551230001",
+                                            "allowed_callers=15551230002")
+        self.path.write_text(text + "log=%s\n" % (self.base / "watch.log"))
+        self.cfg = bridge.Config(self.path)
+        self.store = bridge.Store(self.cfg)
+        output, spawn, _ = self.invoke_agi("offer", {
+            "agi_extension": "s", "agi_callerid": self.cfg.callback,
+            "agi_channel": "PJSIP/mobile", "agi_arg_2": self.cfg.did,
+        })
+        self.assertIn('SET VARIABLE AB_ACTION "WAIT"', output)
+        spawn.assert_called_once()
+        session = self.store.snapshot()
+        self.store.arm(session["token"])
+        output, spawn, cli = self.invoke_agi("route", {
+            "agi_extension": self.cfg.callback_did, "agi_callerid": self.cfg.callback,
+            "agi_channel": "PJSIP/echo",
+        })
+        self.assertTrue(output.rstrip().endswith('SET VARIABLE AB_ACTION "CALLBACK"'))
+        self.assertEqual(self.store.snapshot()["callback"], "PJSIP/echo")
+        spawn.assert_not_called()
+        cli.assert_not_called()
+
+        # Even an allowlisted shared CID can never offer on the callback DID.
+        output, spawn, cli = self.invoke_agi("offer", {
+            "agi_extension": "s", "agi_callerid": self.cfg.callback,
+            "agi_channel": "PJSIP/duplicate", "agi_arg_2": self.cfg.callback_did,
+        })
+        self.assertNotIn('SET VARIABLE AB_ACTION "WAIT"', output)
+        self.assertEqual(self.store.snapshot()["token"], session["token"])
+        spawn.assert_not_called()
+        cli.assert_not_called()
+
+    def test_wrong_cid_on_callback_did_is_rejected_without_claim(self):
+        self.reserve()
+        for caller in ("15551239999", "15551230001", ""):
+            with self.subTest(caller=caller):
+                output, spawn, cli = self.invoke_agi("route", {
+                    "agi_extension": self.cfg.callback_did, "agi_callerid": caller,
+                    "agi_channel": "PJSIP/impostor",
+                })
+                self.assertTrue(output.rstrip().endswith('SET VARIABLE AB_ACTION "REJECT"'))
+                self.assertEqual(self.store.snapshot()["phase"], "waiting")
+                self.assertEqual(self.store.snapshot()["callback"], "")
+                spawn.assert_not_called()
+                cli.assert_not_called()
+
+    def test_echo_cid_on_main_did_is_normal_and_cannot_claim(self):
+        self.reserve()
+        output, spawn, cli = self.invoke_agi("route", {
+            "agi_extension": self.cfg.did, "agi_callerid": self.cfg.callback,
+            "agi_channel": "PJSIP/mobile",
+        })
+        self.assertTrue(output.rstrip().endswith('SET VARIABLE AB_ACTION "NORMAL"'))
+        self.assertEqual(self.store.snapshot()["phase"], "waiting")
+        spawn.assert_not_called()
+        cli.assert_not_called()
+
+    def test_callback_route_stays_rejected_with_disabled_invalid_or_missing_config(self):
+        text = self.path.read_text()
+        for bad in (
+            text.replace("enabled=true", "enabled=false"),
+            text.replace("acknowledge_spoofable_callback=true", "acknowledge_spoofable_callback=false"),
+            text.replace("callback_destination=15551230004\n", ""),
+            "[broken",
+            None,
+        ):
+            with self.subTest(config=bad):
+                if bad is None:
+                    self.path.unlink()
+                else:
+                    self.path.write_text(bad)
+                output, spawn, cli = self.invoke_agi("route", {
+                    "agi_extension": self.cfg.callback_did, "agi_callerid": self.cfg.callback,
+                    "agi_channel": "PJSIP/echo",
+                })
+                self.assertIn('SET VARIABLE AB_ACTION "REJECT"', output)
+                self.assertNotIn('SET VARIABLE AB_ACTION "NORMAL"', output)
+                self.assertNotIn('SET VARIABLE AB_ACTION "CALLBACK"', output)
+                self.assertEqual(self.store.snapshot(), {})
+                spawn.assert_not_called()
+                cli.assert_not_called()
+
+    def test_missing_or_mismatched_callback_global_prevents_activation(self):
+        for hint in ("", "15551239999"):
+            with self.subTest(hint=hint):
+                output, spawn, cli = self.invoke_agi("offer", {
+                    "agi_extension": "s", "agi_callerid": "15551230001",
+                    "agi_channel": "PJSIP/mobile", "agi_arg_2": self.cfg.did,
+                    "agi_arg_3": hint,
+                })
+                self.assertNotIn('SET VARIABLE AB_ACTION "WAIT"', output)
+                spawn.assert_not_called()
+                cli.assert_not_called()
+                self.assertEqual(self.store.snapshot(), {})
+
+                output, spawn, cli = self.invoke_agi("route", {
+                    "agi_extension": self.cfg.callback_did, "agi_callerid": self.cfg.callback,
+                    "agi_channel": "PJSIP/echo", "agi_arg_2": hint,
+                })
+                self.assertTrue(output.rstrip().endswith('SET VARIABLE AB_ACTION "REJECT"'))
+                spawn.assert_not_called()
+                cli.assert_not_called()
+
+    def test_stop_preserves_first_failure_reason(self):
+        session = self.reserve()
+        self.store.stop(session["token"], "callback-timeout")
+        stopped = self.store.stop(session["token"], "watch-ended")
+        self.assertEqual(stopped["reason"], "callback-timeout")
+        self.assertEqual(stopped["phase"], "fallback")
 
     def test_enabled_agi_missing_did_never_plays(self):
         for args in ({}, {"agi_arg_2": "15551239999"}):
@@ -257,7 +377,7 @@ class BridgeTests(unittest.TestCase):
     def test_enabled_callback_with_corrupt_state_fails_closed(self):
         self.store.path.write_text("{broken")
         output, spawn, cli = self.invoke_agi("route", {
-            "agi_extension": self.cfg.did, "agi_callerid": self.cfg.callback,
+            "agi_extension": self.cfg.callback_did, "agi_callerid": self.cfg.callback,
             "agi_channel": "PJSIP/echo",
         })
         self.assertTrue(output.rstrip().endswith('SET VARIABLE AB_ACTION "REJECT"'))
@@ -280,9 +400,13 @@ class BridgeTests(unittest.TestCase):
         self.assertLess(inbound.index("${ALEXABRIDGE},route"), inbound.index("DB(owner/"))
         self.assertLess(inbound.index("Gosub(orata-alexa-offer"), inbound.index("System(${ANNOUNCE}"))
         self.assertIn("ALEXABRIDGE_ENABLED=0", dp)
-        self.assertIn("Gosub(orata-alexa-offer,s,1(${EXTEN}))", inbound)
+        self.assertIn("Gosub(orata-alexa-offer,s,1(${EXTEN},${ALEXABRIDGE_CALLBACK_DID}))", inbound)
+        self.assertIn("AGI(${ALEXABRIDGE},route,${ALEXABRIDGE_CALLBACK_DID})", inbound)
+        self.assertIn("ALEXABRIDGE_CALLBACK_DID=", dp)
+        self.assertLess(inbound.index("Set(AB_ACTION=REJECT)"), inbound.index("${ALEXABRIDGE},route"))
+        self.assertIn('GotoIf($["${ALEXABRIDGE_ENABLED}" != "1"]?bridge-result)', inbound)
         contexts = (ROOT / "asterisk/alexa-callback.conf").read_text()
-        self.assertIn("AGI(${ALEXABRIDGE},offer,${ARG1})", contexts)
+        self.assertIn("AGI(${ALEXABRIDGE},offer,${ARG1},${ARG2})", contexts)
         self.assertIn("CONFBRIDGE(bridge,max_members)=2", contexts)
         self.assertIn("CONFBRIDGE(bridge,record_conference)=no", contexts)
         self.assertIn("CONFBRIDGE(user,timeout)=${AB_LIMIT}", contexts)
@@ -300,6 +424,15 @@ class AudioTests(unittest.TestCase):
             fh.setframerate(8000)
             fh.writeframes(b"\0\0" * 8000)
         self.cfg = {"prompt": str(self.path), "target": "bluez_output.test"}
+
+    def test_service_exposes_pipewire_runtime_without_exposing_homes(self):
+        unit = (ROOT / "etc/orata-audio.service").read_text()
+        self.assertIn("ProtectHome=tmpfs\n", unit)
+        self.assertIn("BindReadOnlyPaths=/run/user/1000\n", unit)
+        self.assertIn("Environment=XDG_RUNTIME_DIR=/run/user/1000\n", unit)
+        self.assertIn("ReadWritePaths=/run/orata-audio\n", unit)
+        self.assertNotIn("ProtectHome=yes\n", unit)
+        self.assertNotIn("ProtectHome=no\n", unit)
 
     def test_fixed_sink_no_shell_and_no_default_fallback(self):
         nodes = [{"info": {"props": {"node.name": self.cfg["target"], "media.class": "Audio/Sink"}}}]

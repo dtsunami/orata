@@ -5,8 +5,21 @@ Updated **2026-10-04**. This is the current handoff, not a fresh-install guide.
 **The phone works; the user reports that Alexa's smoke test worked.**
 The user also confirmed that the saved `alexa_call_orata` command, played
 through the Pi's DCR010 Bluetooth speaker, causes Alexa to place a call.
-An experimental automatic callback bridge is now in source, disabled by
-default and not deployed or live-verified. See [callback prototype](docs/alexa-callback.md).
+
+**2026-10-04: the two-DID callback bridge connected end to end once.**
+The user confirmed a VoIP call to Alexa initiated by Orata via the callback
+path: acoustic prompt played, Echo called the separate callback DID, and the
+conference carried the connected call. Earlier single-DID attempts had not
+established automatic bridging; separating the main and callback DIDs is what
+made the claim path work. This is ONE user-confirmed connection, not a tested
+feature: fallback, teardown, cooldown, concurrency, spoofed-CID rejection and
+repeatability remain unverified, and the repo template stays
+`enabled = false`. See [callback prototype](docs/alexa-callback.md).
+
+The pinned prompt at `/var/lib/orata-audio/alexa-call.wav` SPEAKS THE CALLBACK
+DIGITS on this deployment. Changing the callback DID in the INI or dialplan
+does not change the audio: the WAV must be re-cut and re-pinned, or Alexa
+dials the old number and the waiting caller is dropped at `callback-timeout`.
 Caller-ID spoofing and acoustic activation remain explicit limitations.
 Echo coverage and the complete inbound-call acceptance matrix remain open.
 
@@ -22,6 +35,7 @@ Echo coverage and the complete inbound-call acceptance matrix remain open.
 | Audio fixes | Audio-page crash, WAV format handling, retention and hangup-save guards corrected in source | Exact deployed revision and live hangup behavior not independently audited |
 | Automated tests | All **19 regressions passed**; shell syntax and whitespace checks passed | Tests mock Asterisk/ARC; no Amazon or live-call proof |
 | Alexa ARC | User obtained refresh token after Windows helper packaging failure, then reported smoke-test success | Exact tested Echo(s)/command, multi-device coverage, real inbound name speech |
+| Alexa callback bridge | 2026-10-04: one user-confirmed end-to-end connection on the two-DID path, after re-pinning the digit prompt | Fallback, teardown, cooldown, concurrent legs, spoofed-CID rejection, repeat runs, cold-boot speaker reconnect |
 | ntfy | Implemented independent notification channel | Subscription and actual fallback delivery |
 | Alexa sensor | Script and design document exist | AWS/skill/Routine deployment; entirely optional |
 
@@ -69,6 +83,7 @@ helper; its device private key is not an Orata setting.
 
 ## Documents and deploy boundaries
 
+- [Appliance image (new direction, unbuilt)](docs/appliance.md)
 - [Install / safe update](docs/install.md)
 - [Prioritized next steps and acceptance](docs/next-steps.md)
 - [Alexa ARC / Windows helper workaround](docs/alexa-arc.md)
@@ -77,6 +92,8 @@ helper; its device private key is not an Orata setting.
 - [USB SSD history](docs/usb-ssd-boot.md)
 - [Tests and limitations](test/README.md)
 - [Optional sensor design](docs/alexa-sensor.md)
+- [Experimental Echo callback bridge](docs/alexa-callback.md)
+- [Kubernetes / k3s, evaluated and rejected](docs/kubernetes.md)
 
 Repo configs are templates, not the deployed secrets. Updating binaries must
 not overwrite `/etc/asterisk/*.conf` or `/etc/orata/*.conf`. Merge reviewed
@@ -109,6 +126,10 @@ whole system is finished until those acceptance checks have evidence.
 - Session 5: MicroSIP/PSTN calls worked both directions with audio.
 - 2026-10-04: UI/audio fixes, 19 passing regressions, corrected ARC setup,
   refresh token obtained and Alexa smoke test user-confirmed.
+- 2026-10-04: second DID ordered and routed; callback bridge connected end to
+  end once. Root cause of the preceding failure was a stale pinned prompt
+  still speaking the old DID, fixed by recording a new clip and copying it to
+  `/var/lib/orata-audio/alexa-call.wav`. Added `bin/orata-alexa-prompt.sh`.
 
 Unclosed historical items: Asterisk tarball signature verification,
 voicemail PIN (earlier shipped value must be replaced if still present),

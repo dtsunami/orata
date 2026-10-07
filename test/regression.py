@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 import urllib.parse
@@ -182,11 +183,145 @@ class WebTests(unittest.TestCase):
         self.assertEqual(by_name["ARC speech command"]["d"], "speak")
 
     def test_auth_get_and_post(self):
+        """Unauthenticated requests are refused -- never served.
+
+        The appliance build redirects a browser to /login instead of
+        returning 401. What must hold is that the page body is not
+        delivered; the exact status is secondary.
+        """
         for path, method in (("/", "GET"), ("/audio", "GET"), ("/configure", "GET"),
                              ("/add", "POST"), ("/clips/say", "POST")):
-            with self.subTest(path=path):
-                self.assertEqual(self.get(path, method=method, token=None)[0], 401)
-                self.assertEqual(self.get(path, method=method, token="wrong")[0], 401)
+            for tok in (None, "wrong"):
+                with self.subTest(path=path, token=tok):
+                    status, headers, body = self.get(path, method=method, token=tok)
+                    self.assertIn(status, (303, 401))
+                    if status == 303:
+                        self.assertEqual(headers[b"location"], b"/login")
+                    self.assertNotIn(b"<h1>", body)
+
+    def test_login_page_is_reachable_without_auth(self):
+        status, _, body = self.get("/login", token=None)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Sign in", body)
+
+    def test_password_verify_and_change_roundtrip(self):
+        auth = self.base / "admin-auth.json"
+        with mock.patch.object(web, "AUTH_PATH", str(auth)):
+            web.set_password("correct-horse-battery")
+            self.assertTrue(web.verify_password("correct-horse-battery"))
+            self.assertFalse(web.verify_password("wrong"))
+            self.assertFalse(web.must_change_password())
+            self.assertEqual(oct(auth.stat().st_mode & 0o777), "0o600")
+
+    def test_firstboot_record_forces_password_change(self):
+        auth = self.base / "admin-auth.json"
+        auth.write_text('{"algo":"pbkdf2_sha256","iterations":10,'
+                        '"salt":"AAAA","hash":"AAAA","must_change":true}')
+        with mock.patch.object(web, "AUTH_PATH", str(auth)):
+            self.assertTrue(web.must_change_password())
+
+    def test_session_cookie_is_signed_and_expires(self):
+        with mock.patch.object(web, "SESSION_SECRET", "unit-test-secret"):
+            good = web.make_session()
+            self.assertTrue(web.valid_session(good))
+            self.assertFalse(web.valid_session("garbage"))
+            self.assertFalse(web.valid_session(""))
+            # tampering with the expiry invalidates the signature
+            exp, nonce, sig = good.split(".")
+            self.assertFalse(web.valid_session("%d.%s.%s" % (int(exp) + 9999, nonce, sig)))
+            # a correctly signed but expired cookie is still rejected
+            stale = "%d.%s" % (int(time.time()) - 10, "abcd")
+            self.assertFalse(web.valid_session("%s.%s" % (stale, web._sign(stale))))
+
+    def test_login_throttle_locks_out_after_repeated_failures(self):
+        ip = "203.0.113.9"
+        web.clear_failures(ip)
+        self.addCleanup(web.clear_failures, ip)
+        for _ in range(web.LOCKOUT_AFTER):
+            self.assertEqual(web.throttled(ip), 0)
+            web.note_failure(ip)
+        self.assertGreater(web.throttled(ip), 0)
+        web.clear_failures(ip)
+        self.assertEqual(web.throttled(ip), 0)
+
+    def test_admin_call_reports_missing_helper_without_raising(self):
+        with mock.patch.object(web, "ADMIN_SOCK", str(self.base / "absent.sock")):
+            reply = web.admin_call("get")
+        self.assertFalse(reply["ok"])
+        self.assertIn("helper", reply["error"])
+
+    def test_privileged_pages_degrade_when_helper_is_absent(self):
+        """A dead helper must not 500 the UI or hide why."""
+        with mock.patch.object(web, "ADMIN_SOCK", str(self.base / "absent.sock")):
+            for path in ("/trunk", "/speaker"):
+                with self.subTest(path=path):
+                    status, _, body = self.get(path)
+                    self.assertEqual(status, 200)
+                    self.assertIn(b"orata-admin", body)
+
+    def test_trunk_page_renders_schema_from_helper(self):
+        fake = {
+            "schema": {"ok": True, "fields": {"trunk.pop": {
+                "label": "voip.ms POP hostname",
+                "help": "Hostname of the nearest voip.ms server.",
+                "file": "pjsip.conf", "section": "voipms_reg",
+                "option": "server_uri", "targets": 4}}},
+            "get": {"ok": True, "values": {"trunk.pop": "sanjose2.voip.ms"}},
+            "backups": {"ok": True, "backups": ["pjsip.conf.20261004-120000"]},
+        }
+        with mock.patch.object(web, "admin_call",
+                               side_effect=lambda op, **k: fake.get(op, {"ok": True})):
+            status, _, body = self.get("/trunk")
+        self.assertEqual(status, 200)
+        self.assertIn(b"voip.ms POP hostname", body)
+        self.assertIn(b"sanjose2.voip.ms", body)
+        self.assertIn(b'aria-label="Help"', body)
+
+    def test_trunk_page_only_renders_fields_it_knows_how_to_order(self):
+        """A field the UI does not list must not vanish silently.
+
+        The page renders a fixed `order` list. If the helper gains a field
+        and the UI is not updated, that field is simply absent -- which is
+        how a removed trunk.did went unnoticed. Assert the contract.
+        """
+        fake = {
+            "schema": {"ok": True, "fields": {"trunk.unknown_future_field": {
+                "label": "Not In Order List", "help": "x", "file": "pjsip.conf",
+                "section": "s", "option": "o", "targets": 1}}},
+            "get": {"ok": True, "values": {}},
+            "backups": {"ok": True, "backups": []},
+        }
+        with mock.patch.object(web, "admin_call",
+                               side_effect=lambda op, **k: fake.get(op, {"ok": True})):
+            status, _, body = self.get("/trunk")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"Not In Order List", body)
+        # every key in the helper's real SCHEMA must be in the UI order list
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "oa", Path(web.__file__).parent / "orata-admin-helper.py")
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        page = Path(web.__file__).read_text()
+        order = page.split('order = [', 1)[1].split(']', 1)[0]
+        for key in _mod.SCHEMA:
+            self.assertIn(key, order, "%s is not rendered by /trunk" % key)
+
+    def test_trunk_password_value_is_never_echoed_to_the_browser(self):
+        fake = {
+            "schema": {"ok": True, "fields": {"trunk.password": {
+                "label": "Sub-account password", "help": "SIP password.",
+                "file": "pjsip.conf", "section": "voipms-auth",
+                "option": "password"}}},
+            "get": {"ok": True, "values": {"trunk.password": "set"}},
+            "backups": {"ok": True, "backups": []},
+        }
+        with mock.patch.object(web, "admin_call",
+                               side_effect=lambda op, **k: fake.get(op, {"ok": True})):
+            status, _, body = self.get("/trunk")
+        self.assertEqual(status, 200)
+        self.assertIn(b'type="password"', body)
+        self.assertNotIn(b'value="set"', body)
 
     def test_token_redirect_cookie(self):
         status, headers, _ = self.get("/?token=test-token", token=None)
@@ -234,6 +369,229 @@ class WebTests(unittest.TestCase):
         text = "text: Press 1 to replay, 2 to save, 3 to re-record, or star to cancel."
         (self.clips / "role-rec-menu.txt").write_text(text)
         self.assertEqual(web.role_source("rec-menu"), text)
+
+
+class AdminHelperTests(unittest.TestCase):
+    """The privileged helper's validators and INI rewriter.
+
+    Imported as a module and exercised directly: these functions are the
+    trust boundary between the web UI and root, so they are tested without
+    a socket or a running service in the way.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "orata_admin", ROOT / "bin/orata-admin-helper.py")
+        cls.helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.helper)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix=".admin-regression-",
+                                               dir=ROOT / "test")
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def test_newline_injection_is_rejected(self):
+        """The whole point of the enumerated surface: no smuggled INI lines."""
+        check = self.helper._plain(120)
+        for bad in ("a\nmalicious = 1", "a\r\nmalicious = 1", "a\x00b"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    check(bad)
+
+    def test_field_patterns_reject_plausible_mistakes(self):
+        pop = self.helper.SCHEMA["trunk.pop"][1]
+        self.assertEqual(pop("sanjose2.voip.ms"), "sanjose2.voip.ms")
+        for bad in ("sip:sanjose2.voip.ms", "host with space", "", "ab"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    pop(bad)
+
+    def test_pop_is_written_to_every_place_it_appears(self):
+        """A POP change must not leave registration and identify disagreeing."""
+        conf = self.base / "pjsip.conf"
+        conf.write_text(
+            "[voipms_auth]\nusername=574149_orata\npassword=secret\n\n"
+            "[voipms_aor]\ntype=aor\ncontact=sip:old.voip.ms:5060\n\n"
+            "[voipms_reg]\ntype=registration\n"
+            "server_uri=sip:old.voip.ms\n"
+            "client_uri=sip:574149_orata@old.voip.ms\n\n"
+            "[voipms_identify]\ntype=identify\nmatch=old.voip.ms\n")
+        with mock.patch.object(self.helper, "PJSIP", str(conf)), \
+             mock.patch.object(self.helper, "BACKUP_DIR", str(self.base / "bk")), \
+             mock.patch.dict(self.helper.SCHEMA, {"trunk.pop": (
+                 [(str(conf), "voipms_reg", "server_uri"),
+                  (str(conf), "voipms_reg", "client_uri"),
+                  (str(conf), "voipms_identify", "match"),
+                  (str(conf), "voipms_aor", "contact")],
+                 self.helper.SCHEMA["trunk.pop"][1], "POP", "help")}):
+            reply = self.helper.op_set({"field": "trunk.pop",
+                                        "value": "seattle.voip.ms"})
+        self.assertTrue(reply["ok"])
+        text = conf.read_text()
+        self.assertNotIn("old.voip.ms", text)
+        self.assertIn("server_uri = sip:seattle.voip.ms", text)
+        # the sub-account must survive the client_uri rewrite
+        self.assertIn("client_uri = sip:574149_orata@seattle.voip.ms", text)
+        self.assertIn("match = seattle.voip.ms", text)
+        self.assertIn("contact = sip:seattle.voip.ms:5060", text)
+
+    def test_multi_target_write_is_refused_before_any_change(self):
+        """A missing section must abort the whole field, not half-apply it."""
+        conf = self.base / "pjsip.conf"
+        original = ("[voipms_reg]\nserver_uri=sip:old.voip.ms\n"
+                    "client_uri=sip:u@old.voip.ms\n")
+        conf.write_text(original)
+        with mock.patch.object(self.helper, "PJSIP", str(conf)), \
+             mock.patch.object(self.helper, "BACKUP_DIR", str(self.base / "bk")), \
+             mock.patch.dict(self.helper.SCHEMA, {"trunk.pop": (
+                 [(str(conf), "voipms_reg", "server_uri"),
+                  (str(conf), "voipms_absent", "match")],
+                 self.helper.SCHEMA["trunk.pop"][1], "POP", "help")}):
+            with self.assertRaises(ValueError):
+                self.helper.op_set({"field": "trunk.pop", "value": "new.voip.ms"})
+        self.assertEqual(conf.read_text(), original)
+
+    def test_pop_hostname_is_extracted_for_display(self):
+        self.assertEqual(self.helper._pop_of("sip:sanjose2.voip.ms"),
+                         "sanjose2.voip.ms")
+        self.assertEqual(self.helper._pop_of("sip:574149_orata@sanjose2.voip.ms"),
+                         "sanjose2.voip.ms")
+        self.assertEqual(self.helper._pop_of("sip:sanjose2.voip.ms:5060"),
+                         "sanjose2.voip.ms")
+
+    def test_mac_validator(self):
+        self.assertEqual(self.helper.bt_mac("08:eb:ed:71:f9:02"),
+                         "08:EB:ED:71:F9:02")
+        for bad in ("08:EB:ED:71:F9", "not-a-mac", "08:EB:ED:71:F9:02; rm -rf /"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    self.helper.bt_mac(bad)
+
+    def test_write_option_preserves_comments_and_other_sections(self):
+        conf = self.base / "pjsip.conf"
+        conf.write_text("; leading comment\n"
+                        "[voipms-auth]\n"
+                        "type = auth\n"
+                        "username = old_user\n"
+                        "password = old_pass\n"
+                        "\n"
+                        "[other]\n"
+                        "username = untouched\n")
+        with mock.patch.object(self.helper, "BACKUP_DIR", str(self.base / "bk")):
+            self.helper.write_option(str(conf), "voipms-auth", "username", "new_user")
+        text = conf.read_text()
+        self.assertIn("; leading comment", text)
+        self.assertIn("username = new_user", text)
+        self.assertNotIn("old_user", text)
+        self.assertIn("username = untouched", text)
+        self.assertIn("password = old_pass", text)
+
+    def test_write_option_adds_missing_option_to_existing_section(self):
+        conf = self.base / "pjsip.conf"
+        conf.write_text("[voipms-reg]\ntype = registration\n")
+        with mock.patch.object(self.helper, "BACKUP_DIR", str(self.base / "bk")):
+            self.helper.write_option(str(conf), "voipms-reg", "server_uri",
+                                     "sip:seattle.voip.ms")
+        self.assertIn("server_uri = sip:seattle.voip.ms", conf.read_text())
+
+    def test_write_option_refuses_unknown_section(self):
+        conf = self.base / "pjsip.conf"
+        conf.write_text("[voipms-auth]\ntype = auth\n")
+        with mock.patch.object(self.helper, "BACKUP_DIR", str(self.base / "bk")):
+            with self.assertRaises(ValueError):
+                self.helper.write_option(str(conf), "nonexistent", "k", "v")
+
+    def test_write_option_keeps_a_backup(self):
+        conf = self.base / "pjsip.conf"
+        conf.write_text("[voipms-auth]\nusername = before\n")
+        bk = self.base / "bk"
+        with mock.patch.object(self.helper, "BACKUP_DIR", str(bk)):
+            self.helper.write_option(str(conf), "voipms-auth", "username", "after")
+        saved = list(bk.iterdir())
+        self.assertEqual(len(saved), 1)
+        self.assertIn("username = before", saved[0].read_text())
+
+    def test_weak_and_malformed_pins_are_refused(self):
+        vm = self.base / "voicemail.conf"
+        vm.write_text("[default]\n100 => 1234,Orata,\n")
+        with mock.patch.object(self.helper, "VOICEMAIL", str(vm)), \
+             mock.patch.object(self.helper, "BACKUP_DIR", str(self.base / "bk")):
+            for bad in ("1234", "0000", "abc", "12", "1" * 11):
+                with self.subTest(pin=bad):
+                    with self.assertRaises(ValueError):
+                        self.helper.op_set_pin({"value": bad})
+            self.helper.op_set_pin({"value": "80531"})
+        self.assertIn("100 => 80531", vm.read_text())
+
+    def test_audio_target_rejects_a_sink_pipewire_does_not_report(self):
+        """A typo must be impossible to write, not merely discouraged.
+
+        The old workflow was copy-paste from pw-dump, and a wrong value
+        surfaced only mid-call as a missing sink.
+        """
+        conf = self.base / "alexa-bridge.conf"
+        conf.write_text("[audio]\ntarget = bluez_output.OLD.1\n")
+        with mock.patch.object(self.helper, "BRIDGE_CONF", str(conf)), \
+             mock.patch.object(self.helper, "BACKUP_DIR", str(self.base / "bk")), \
+             mock.patch.object(self.helper, "bt_sinks",
+                               return_value=[{"name": "bluez_output.REAL.1",
+                                              "desc": "Speaker"}]):
+            with self.assertRaises(ValueError):
+                self.helper.op_audio_target({"target": "bluez_output.TYPO.1"})
+            # the config must be untouched after a refusal
+            self.assertIn("bluez_output.OLD.1", conf.read_text())
+            reply = self.helper.op_audio_target({"target": "bluez_output.REAL.1"})
+        self.assertTrue(reply["ok"])
+        self.assertIn("target = bluez_output.REAL.1", conf.read_text())
+
+    def test_audio_target_rejects_injection_and_missing_config(self):
+        conf = self.base / "alexa-bridge.conf"
+        conf.write_text("[audio]\ntarget = x\n")
+        with mock.patch.object(self.helper, "BRIDGE_CONF", str(conf)), \
+             mock.patch.object(self.helper, "bt_sinks", return_value=[]):
+            for bad in ("a\nenabled = true", "a\x00b", 12345):
+                with self.subTest(value=bad):
+                    with self.assertRaises(ValueError):
+                        self.helper.op_audio_target({"target": bad})
+        with mock.patch.object(self.helper, "BRIDGE_CONF",
+                               str(self.base / "absent.conf")), \
+             mock.patch.object(self.helper, "bt_sinks",
+                               return_value=[{"name": "s", "desc": ""}]):
+            with self.assertRaises(ValueError):
+                self.helper.op_audio_target({"target": "s"})
+
+    def test_audio_state_reports_configured_sink_presence(self):
+        conf = self.base / "alexa-bridge.conf"
+        conf.write_text("[audio]\ntarget = bluez_output.GONE.1\n"
+                        "prompt = /nonexistent.wav\n")
+        with mock.patch.object(self.helper, "BRIDGE_CONF", str(conf)), \
+             mock.patch.object(self.helper, "bt_sinks",
+                               return_value=[{"name": "bluez_output.HERE.1",
+                                              "desc": "Other"}]):
+            state = self.helper.op_audio_state({})
+        self.assertEqual(state["configured"], "bluez_output.GONE.1")
+        self.assertFalse(state["present"])
+        self.assertFalse(state["prompt_info"].get("exists"))
+
+    def test_audio_state_validates_the_pinned_prompt(self):
+        conf = self.base / "alexa-bridge.conf"
+        good = self.base / "prompt.wav"
+        wav(good)  # 0.1s -- deliberately too short for the worker's 0.2s floor
+        conf.write_text("[audio]\ntarget = s\nprompt = %s\n" % good)
+        with mock.patch.object(self.helper, "BRIDGE_CONF", str(conf)), \
+             mock.patch.object(self.helper, "bt_sinks",
+                               return_value=[{"name": "s", "desc": ""}]):
+            state = self.helper.op_audio_state({})
+        self.assertTrue(state["prompt_info"]["exists"])
+        self.assertFalse(state["prompt_info"]["valid"])
+        self.assertTrue(state["present"])
+
+    def test_unknown_op_and_field_are_refused(self):
+        with self.assertRaises(ValueError):
+            self.helper.op_set({"field": "../../etc/shadow", "value": "x"})
+        self.assertNotIn("definitely-not-an-op", self.helper.OPS)
 
 
 class ClipTests(unittest.TestCase):

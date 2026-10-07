@@ -1,8 +1,10 @@
 # Next steps — finish the household phone
 
 Updated 2026-10-04. Alexa's initial smoke test is **user-confirmed**; the
-tested device count/command was not recorded. This plan scopes remaining
-work, not a commitment to add new infrastructure.
+tested device count/command was not recorded. The two-DID callback bridge
+also connected end to end once on 2026-10-04; its acceptance work is P5 and
+does not block the release. This plan scopes remaining work, not a commitment
+to add new infrastructure.
 
 ## P0 — Power up and verify the remaining Echos
 
@@ -127,6 +129,32 @@ by this documentation change.
 - Tune gate wording/timing from real callers, preserving block-before-answer.
 - Improve UI error guidance based on acceptance failures. System credentials
   stay file-managed; no generic config editor or new frontend build required.
+
+## P5 — Callback bridge acceptance, after the release checks
+
+One connection is not a feature. Do these with test traffic and the bridge
+re-disabled afterwards if any fail; keep the repo template at
+`enabled = false`. Do not delete state files to bypass cooldown.
+
+| Case | Expected result |
+|---|---|
+| Playback fails (speaker off/unreachable sink) | Original caller falls back to SIP/voicemail, no hang |
+| No callback within the window | `callback-timeout`, caller released to SIP/voicemail |
+| Callback arrives after cooldown | Declined; no playback, ring or voicemail |
+| Either party hangs up mid-call | Both legs torn down; no orphaned conference or watcher |
+| Wrong CID on the callback DID | Declined; conference not joined |
+| Second caller during a pending session | Rings SIP normally; no second acoustic prompt |
+| Ordinary caller dials the callback DID | Rejected without ringing |
+| Repeat the full path three times | Same outcome each time, including after cooldown |
+| Reboot, then repeat | Bluetooth sink reconnects without interactive login |
+
+Verify after any DID change that the pinned WAV, INI `callback_destination`
+and `ALEXABRIDGE_CALLBACK_DID` all name the same number. Nothing checks the
+WAV automatically; `md5sum` the clip against the pinned copy after re-pinning.
+
+**Exit:** fallback and teardown observed directly, not inferred from a
+successful call; `/var/log/orata/alexa-bridge.log` explains each outcome.
+Spoofable callback CID remains an accepted, documented risk, not a solved one.
 
 ## Scope boundaries and definition of done
 

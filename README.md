@@ -299,6 +299,14 @@ reload. Or assign a `*96` recording to use your own voice instead.
 | `rec-start` | `*96`, before recording begins |
 | `rec-menu` | `*96`, the replay / save / re-record menu |
 | `rec-saved` | `*96`, after a clip is saved |
+| `call-from` | spliced before a recorded caller name in local/SIP audio |
+| `owner-menu` | **nothing — accepted by the CLI but never played.** See below |
+
+`orata-clip.sh` accepts all six roles, but the dialplan only plays the first
+four and `orata-announce.sh` only uses `call-from`. Recording `owner-menu`
+has no audible effect anywhere; it is a leftover in `VALID_ROLES`. The web UI
+lists five (it omits `owner-menu`), so the CLI, the UI and the dialplan three
+disagree. Do not treat an `owner-menu` override as a working prompt.
 
     orata-clip.sh say press-one "Press 1 to continue."
     orata-clip.sh roles                     # what is overridden

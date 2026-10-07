@@ -1,0 +1,66 @@
+# /etc/systemd/system/orata-admin.service
+#
+# Privileged helper for the appliance UI. This is the ONLY component that
+# writes /etc/asterisk or talks to BlueZ. It exists so that orata-web can
+# keep NoNewPrivileges and no write access to /etc.
+#
+# It must stay narrow: the command surface is enumerated in the script, and
+# there is deliberately no "write arbitrary file" operation. Review
+# docs/web-ui.md before adding one.
+
+[Unit]
+Description=orata privileged admin helper
+After=asterisk.service bluetooth.service
+Wants=asterisk.service
+
+[Service]
+Type=simple
+# Root: it writes /etc/asterisk and pairs Bluetooth devices. The socket is
+# the trust boundary, not the process UID.
+User=root
+ExecStart=/usr/bin/python3 /usr/local/bin/orata-admin-helper.py
+Restart=on-failure
+RestartSec=5
+# The socket inside is root:asterisk 0660, but that is unreachable unless
+# the DIRECTORY is group-traversable too. RuntimeDirectory= defaults to
+# root:root, so name the group here: without it, orata-web gets EACCES on
+# connect and every privileged page reports "helper unavailable".
+#
+# Set the group on the DIRECTORY, not on the service. Using Group=asterisk
+# would also set the process GID to asterisk, and the helper would then
+# lack the group privileges it needs to drop to the desktop user for
+# pw-dump -- preexec_fn fails and the Bluetooth sink list comes back empty.
+RuntimeDirectory=orata-admin
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=no
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+# ProtectHome=yes would also hide /run/user, and the helper must reach the
+# desktop user's PipeWire socket there to list audio sinks. tmpfs plus an
+# explicit read-only bind keeps home directories hidden while leaving that
+# one path visible -- the same exception orata-audio.service makes.
+# Update the UID here if the desktop owner is not 1000.
+ProtectHome=tmpfs
+BindReadOnlyPaths=/run/user/1000
+ProtectSystem=strict
+# /etc/orata too: the Bluetooth page writes the selected sink into
+# alexa-bridge.conf so the pairing UI and the callback bridge cannot drift.
+ReadWritePaths=/etc/asterisk /etc/orata /var/lib/orata /var/run/asterisk
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+
+# The helper runs pw-dump as the desktop user to list audio sinks, which
+# needs CAP_SETUID/CAP_SETGID. Combining several sandboxing directives
+# leaves those out of the effective set even for a User=root service, so
+# request them explicitly. Measured, not assumed: without these two lines
+# the subprocess fails with EPERM and the sink list is silently empty.
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

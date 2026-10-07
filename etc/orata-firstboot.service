@@ -1,0 +1,22 @@
+# /etc/systemd/system/orata-firstboot.service
+#
+# Runs once per cloned image to generate per-device secrets. orata-web is
+# ordered After= this and will not serve until it has completed, so a
+# freshly flashed card can never present a shared password.
+
+[Unit]
+Description=orata first-boot provisioning
+After=network-online.target
+Wants=network-online.target
+Before=orata-web.service
+ConditionPathExists=!/var/lib/orata/.firstboot-done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/orata-firstboot.sh
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

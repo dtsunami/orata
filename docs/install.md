@@ -43,6 +43,14 @@ user exist:
     sudo install -m 755 bin/orata-cnam.sh bin/orata-clip.sh \
       bin/orata-announce.sh bin/orata-alexa-sensor.sh /usr/local/bin/
 
+This list is the core install only. The experimental Echo callback bridge
+(`orata-alexa-bridge.py`, `orata-audio-worker.py`, `orata-alexa-prompt.sh`,
+`asterisk/alexa-callback.conf`, `etc/alexa-bridge.conf`, the tmpfiles and
+`orata-audio` unit) is deliberately NOT installed here. It is optional,
+disabled by default and has its own procedure with carrier prerequisites:
+[alexa-callback.md](alexa-callback.md). Do not install it during a fresh
+build; finish acceptance first.
+
 Giving announce.conf mode 600 without changing its owner makes it unreadable
 to Asterisk; the ownership above is intentional. Keep all credentials out of
 the repo. Use `sudoedit` on live files.

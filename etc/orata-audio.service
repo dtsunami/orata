@@ -15,7 +15,11 @@ RestartSec=5
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=yes
+# Hide home directories, but expose the owner's PipeWire runtime sockets.
+# A read-only directory bind still permits connecting to Unix sockets and
+# follows socket replacement after PipeWire restarts.
+ProtectHome=tmpfs
+BindReadOnlyPaths=/run/user/1000
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

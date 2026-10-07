@@ -68,6 +68,16 @@ install -d -m 700 -o asterisk -g asterisk /var/lib/orata
 echo "==> installing /usr/local/bin/orata_web.py"
 install -m 755 "$REPO/bin/orata_web.py" /usr/local/bin/orata_web.py
 
+# --- privileged helper -----------------------------------------------
+# The UI cannot write /etc/asterisk or pair Bluetooth devices; this root
+# service does, behind an enumerated unix-socket protocol.
+echo "==> installing privileged helper (orata-admin)"
+install -m 755 "$REPO/bin/orata-admin-helper.py" /usr/local/bin/orata-admin-helper.py
+install -m 755 "$REPO/bin/orata-firstboot.sh" /usr/local/bin/orata-firstboot.sh
+install -d -m 700 -o asterisk -g asterisk /var/lib/orata/config-backups
+install -m 644 "$REPO/etc/orata-admin.service" /etc/systemd/system/
+install -m 644 "$REPO/etc/orata-firstboot.service" /etc/systemd/system/
+
 # --- config ----------------------------------------------------------
 if [ -f "$CONF" ]; then
     echo "==> keeping existing $CONF"
@@ -107,8 +117,16 @@ chmod 600 "$CONF"
 echo "==> installing systemd unit"
 install -m 644 "$REPO/etc/orata-web.service" "$UNIT"
 systemctl daemon-reload
+systemctl enable orata-admin >/dev/null 2>&1 || true
+systemctl restart orata-admin
+systemctl enable orata-firstboot >/dev/null 2>&1 || true
 systemctl enable orata-web >/dev/null 2>&1 || true
 systemctl restart orata-web
+
+if ! systemctl is-active --quiet orata-admin; then
+    echo "!! orata-admin is not running; Trunk and Bluetooth pages will show" >&2
+    echo "   'helper unavailable'. Check: journalctl -u orata-admin -n 20" >&2
+fi
 
 sleep 2
 if ! systemctl is-active --quiet orata-web; then

@@ -22,14 +22,27 @@
 # A compromise here is a compromise of call routing. Bind to localhost or
 # a WireGuard address. Never a WAN interface. See docs/web-ui.md.
 #
+# APPLIANCE BUILD: this process still cannot write /etc/asterisk and still
+# cannot touch BlueZ. Those requests go over a unix socket to
+# orata-admin-helper.py, which runs as root with an ENUMERATED command
+# surface. Adding a "write any file" verb there would defeat the whole
+# arrangement. Auth is username/password against /var/lib/orata/admin-auth.json,
+# generated per device at first boot; the old shared ?token= path remains
+# only for an already-installed non-appliance instance that has one set.
+#
 
+import base64
 import glob
+import hashlib
 import hmac
 import html
+import json
 import math
 import os
 import re
+import secrets
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -82,6 +95,146 @@ CLIP_DIR = (CFG.get("ORATA_WEB_CLIP_DIR") or ACFG.get("ORATA_CLIP_DIR")
 CLIP_SH = CFG.get("ORATA_CLIP_SH", "/usr/local/bin/orata-clip.sh")
 
 esc = html.escape
+
+# =====================================================================
+# appliance auth + privileged helper client
+# =====================================================================
+
+AUTH_PATH = CFG.get("ORATA_WEB_AUTH", "/var/lib/orata/admin-auth.json")
+ADMIN_SOCK = CFG.get("ORATA_ADMIN_SOCK", "/run/orata-admin/admin.sock")
+SESSION_SECRET = CFG.get("ORATA_WEB_SECRET", "")
+SESSION_HOURS = 12
+
+# Login throttle. In-memory and per-process, so it is lost on restart and is
+# NOT a substitute for rate limiting at a reverse proxy -- but it turns an
+# online password guess from thousands per second into a handful per minute,
+# which is the difference that matters for a 12-character password.
+_FAILS = {}
+_FAIL_LOCK = __import__("threading").Lock()
+LOCKOUT_AFTER = 5
+LOCKOUT_SECS = 60
+
+
+def load_auth():
+    try:
+        with open(AUTH_PATH) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def verify_password(password):
+    rec = load_auth()
+    if not rec.get("hash") or not rec.get("salt"):
+        return False
+    try:
+        salt = base64.b64decode(rec["salt"])
+        want = base64.b64decode(rec["hash"])
+    except (ValueError, TypeError):
+        return False
+    got = hashlib.pbkdf2_hmac("sha256", password.encode(), salt,
+                              int(rec.get("iterations", 200000)))
+    return hmac.compare_digest(got, want)
+
+
+def set_password(password):
+    """Rewrite the credential file atomically and clear must_change."""
+    rec = load_auth()
+    salt = os.urandom(16)
+    iterations = 200000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    rec.update({"algo": "pbkdf2_sha256", "iterations": iterations,
+                "salt": base64.b64encode(salt).decode(),
+                "hash": base64.b64encode(digest).decode(),
+                "username": rec.get("username", "admin"),
+                "must_change": False,
+                "changed": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    tmp = AUTH_PATH + ".new"
+    with open(tmp, "w") as fh:
+        json.dump(rec, fh, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, AUTH_PATH)
+
+
+def must_change_password():
+    return bool(load_auth().get("must_change"))
+
+
+def _sign(payload):
+    key = (SESSION_SECRET or TOKEN or "orata").encode()
+    return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def make_session():
+    exp = int(time.time()) + SESSION_HOURS * 3600
+    payload = "%d.%s" % (exp, secrets.token_hex(8))
+    return "%s.%s" % (payload, _sign(payload))
+
+
+def valid_session(cookie):
+    if not cookie or cookie.count(".") != 2:
+        return False
+    exp, nonce, sig = cookie.split(".")
+    payload = "%s.%s" % (exp, nonce)
+    if not hmac.compare_digest(_sign(payload), sig):
+        return False
+    try:
+        return int(exp) > time.time()
+    except ValueError:
+        return False
+
+
+def throttled(ip):
+    with _FAIL_LOCK:
+        count, until = _FAILS.get(ip, (0, 0.0))
+        if until > time.time():
+            return int(until - time.time())
+        return 0
+
+
+def note_failure(ip):
+    with _FAIL_LOCK:
+        count, _until = _FAILS.get(ip, (0, 0.0))
+        count += 1
+        until = time.time() + LOCKOUT_SECS if count >= LOCKOUT_AFTER else 0.0
+        _FAILS[ip] = (0 if until else count, until)
+
+
+def clear_failures(ip):
+    with _FAIL_LOCK:
+        _FAILS.pop(ip, None)
+
+
+def admin_call(op, timeout=40, **kwargs):
+    """One request/response to the privileged helper. Never raises."""
+    req = dict(kwargs)
+    req["op"] = op
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(ADMIN_SOCK)
+            sock.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                buf += chunk
+        if not buf:
+            return {"ok": False, "error": "helper closed the connection"}
+        return json.loads(buf.split(b"\n", 1)[0].decode())
+    except FileNotFoundError:
+        return {"ok": False, "error":
+                "privileged helper not running (systemctl status orata-admin)"}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": "helper unreachable: %s" % exc}
+
+
+def admin_available():
+    return os.path.exists(ADMIN_SOCK)
+
 
 BOOKS = [
     ("cnam", "Name book", "add", "del", "Spoken name",
@@ -442,9 +595,14 @@ orata <span class="tag">{{HOST}}</span></span>
 </div></body></html>
 """
 
-TABS = [("/", "Dashboard"), ("/configure", "Configure"), ("/books", "Books"),
-        ("/devices", "Devices"), ("/audio", "Audio"), ("/diag", "Diagnostics"),
-        ("/harness", "Harness"), ("/log", "Log")]
+# Tab labels answer "what do I click to change X", so they name the thing
+# the user is thinking about, not the subsystem. "Audio" and "Speaker" sat
+# next to each other meaning recordings-callers-hear and which-physical-
+# output-the-Echo-bridge-uses, which is not guessable from either word.
+TABS = [("/", "Dashboard"), ("/configure", "Configure"), ("/trunk", "Trunk"),
+        ("/books", "Books"), ("/devices", "Phones"),
+        ("/audio", "Recordings"), ("/speaker", "Echo bridge"),
+        ("/diag", "Diagnostics"), ("/harness", "Harness"), ("/log", "Log")]
 
 
 def render(active, title, body, flash=""):
@@ -476,18 +634,147 @@ def flash_of(request):
 app = FastAPI(title="orata", docs_url=None, redoc_url=None, openapi_url=None)
 
 
+LOGIN_EXEMPT = ("/login", "/favicon.svg", "/favicon.ico")
+
+
 def require_auth(request: Request):
-    tok = (request.headers.get("x-orata-token")
-           or request.cookies.get("orata_token")
-           or request.query_params.get("token", ""))
-    # Fail closed: an unconfigured token must not mean "open to all".
-    if not TOKEN or not hmac.compare_digest(tok, TOKEN):
-        raise HTTPException(status_code=401, detail="orata: missing or bad token")
-    return True
+    """Session cookie, or the legacy shared token if one is still set.
+
+    Appliance images ship with ORATA_WEB_TOKEN empty (first boot clears it),
+    so the token branch is dead there. It is kept so that an existing
+    hand-built install keeps working across this upgrade.
+    """
+    if valid_session(request.cookies.get("orata_session", "")):
+        if must_change_password() and request.url.path not in ("/password", "/logout"):
+            raise HTTPException(status_code=303, detail="/password")
+        return True
+    if TOKEN:
+        tok = (request.headers.get("x-orata-token")
+               or request.cookies.get("orata_token")
+               or request.query_params.get("token", ""))
+        if hmac.compare_digest(tok, TOKEN):
+            return True
+    raise HTTPException(status_code=303, detail="/login")
+
+
+def client_ip(request: Request):
+    return request.client.host if request.client else "?"
+
+
+LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>orata - sign in</title><style>%s
+.lg{max-width:22rem;margin:4rem auto}
+.lg .card{padding:0}.lg .body{padding:1.1rem}
+.lg input{width:100%%;box-sizing:border-box;margin:.3rem 0 .9rem}
+</style></head><body><div class="wrap lg">
+<h1 style="text-align:center">orata</h1>
+%s
+<section class="card"><h2>%s</h2><div class="body">
+<form method="post" action="%s">%s
+<label class="field">%s<input class="in" type="%s" name="%s" %s autofocus></label>
+%s
+<button class="btn primary" type="submit" style="width:100%%">%s</button>
+</form>
+<p class="hint" style="margin-bottom:0">%s</p>
+</div></section></div></body></html>"""
+
+
+@app.get("/login", response_class=HTMLResponse)
+def page_login(request: Request):
+    if valid_session(request.cookies.get("orata_session", "")):
+        return RedirectResponse("/", status_code=303)
+    msg = request.query_params.get("msg", "")
+    flash = '<div class="flash err">%s</div>' % esc(msg) if msg else ""
+    return HTMLResponse(LOGIN_PAGE % (
+        CSS, flash, "Sign in", "/login", "",
+        "Password", "password", "password", 'required',
+        '<input type="hidden" name="username" value="admin">',
+        "Sign in",
+        "Default credentials are printed on the console on first boot. "
+        "This appliance has no TLS &mdash; keep it on your LAN."))
+
+
+@app.post("/login")
+def do_login(request: Request, password: str = Form(""), username: str = Form("admin")):
+    ip = client_ip(request)
+    wait = throttled(ip)
+    if wait:
+        return RedirectResponse(
+            "/login?msg=%s" % urllib.parse.quote_plus(
+                "Too many attempts. Wait %ds." % wait), status_code=303)
+    if not verify_password(password):
+        note_failure(ip)
+        return RedirectResponse(
+            "/login?msg=%s" % urllib.parse.quote_plus("Wrong password."),
+            status_code=303)
+    clear_failures(ip)
+    dest = "/password" if must_change_password() else "/"
+    resp = RedirectResponse(dest, status_code=303)
+    resp.set_cookie("orata_session", make_session(), httponly=True,
+                    samesite="strict", max_age=SESSION_HOURS * 3600, path="/")
+    return resp
+
+
+@app.get("/logout")
+def do_logout():
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie("orata_session", path="/")
+    return resp
+
+
+@app.get("/password", response_class=HTMLResponse)
+def page_password(request: Request, _=Depends(require_auth)):
+    msg = request.query_params.get("msg", "")
+    forced = must_change_password()
+    flash = '<div class="flash%s">%s</div>' % (
+        " err" if msg else "", esc(msg)) if msg else (
+        '<div class="flash err">Choose a new password before continuing.</div>'
+        if forced else "")
+    return HTMLResponse(LOGIN_PAGE % (
+        CSS, flash, "Change password", "/password", "",
+        "New password", "password", "new1", 'required minlength="10"',
+        '<label class="field">Repeat<input class="in" type="password" '
+        'name="new2" required minlength="10"></label>',
+        "Set password",
+        "Minimum 10 characters. There is no recovery question: if you lose "
+        "this, reset it over SSH with "
+        '<span class="mono">sudo rm /var/lib/orata/.firstboot-done</span> '
+        "then restart orata-firstboot."))
+
+
+@app.post("/password")
+def do_password(request: Request, new1: str = Form(""), new2: str = Form(""),
+                _=Depends(require_auth)):
+    if new1 != new2:
+        return RedirectResponse("/password?msg=%s" % urllib.parse.quote_plus(
+            "Those did not match."), status_code=303)
+    if len(new1) < 10:
+        return RedirectResponse("/password?msg=%s" % urllib.parse.quote_plus(
+            "Use at least 10 characters."), status_code=303)
+    if verify_password(new1):
+        return RedirectResponse("/password?msg=%s" % urllib.parse.quote_plus(
+            "That is the current password."), status_code=303)
+    try:
+        set_password(new1)
+    except OSError as exc:
+        return RedirectResponse("/password?msg=%s" % urllib.parse.quote_plus(
+            "Could not save: %s" % exc), status_code=303)
+    resp = RedirectResponse("/?msg=%s" % urllib.parse.quote_plus(
+        "Password changed."), status_code=303)
+    resp.set_cookie("orata_session", make_session(), httponly=True,
+                    samesite="strict", max_age=SESSION_HOURS * 3600, path="/")
+    return resp
 
 
 @app.exception_handler(HTTPException)
 async def on_http_error(request: Request, exc: HTTPException):
+    # require_auth signals "not signed in" with 303 + a destination, so an
+    # unauthenticated browser lands on the login form instead of a wall of
+    # plain text. API-style callers using the legacy token still get 401.
+    if exc.status_code == 303 and isinstance(exc.detail, str) \
+            and exc.detail.startswith("/"):
+        return RedirectResponse(exc.detail, status_code=303)
     return PlainTextResponse("orata: %s\n" % exc.detail, status_code=exc.status_code)
 
 
@@ -1939,11 +2226,12 @@ def devices_body():
     secs = pjsip_sections()
     cmap = contact_map()
     ip = lan_ip()
-    out = ['<h1>Devices</h1>',
+    out = ['<h1>Phones</h1>',
            '<p class="lede">Every field a softphone asks for, read live from '
-           '<span class="mono">%s</span>. Nothing on this page is editable &mdash; '
-           'changing a device means editing that file and running '
-           '<span class="mono">pjsip reload</span>.</p>' % esc(PJSIP_CONF)]
+           '<span class="mono">%s</span>. This page is read-only: handset '
+           'passwords and the ring group are still hand-edited. Trunk '
+           'credentials and the POP <i>are</i> editable, on '
+           '<a href="/trunk">Trunk</a>.</p>' % esc(PJSIP_CONF)]
 
     if not secs:
         out.append('<div class="verdict bad"><b>Cannot read %s.</b> The web UI runs as '
@@ -2118,10 +2406,14 @@ def audio_file(f: str = "", _=Depends(require_auth)):
 @app.get("/audio", response_class=HTMLResponse)
 def page_audio(request: Request, _=Depends(require_auth)):
     rows = audio_files(50)
-    body = ["<h1>Announcement audio</h1>",
-            '<p class="lede">Every announcement is also rendered to a WAV on the Pi, '
-            "newest first. This is how you check what was said without an Echo in "
-            "earshot &mdash; but it is a <b>local render of the phrase</b>, not proof "
+    body = ["<h1>Recordings &amp; prompts</h1>",
+            '<p class="lede">Everything <b>callers and your handsets</b> hear: the '
+            "gate prompt, caller-name clips, and recordings you make with "
+            '<span class="mono">*96</span>. For which physical speaker the Echo '
+            'callback bridge talks to, see <a href="/speaker">Echo bridge</a>.</p>'
+            '<p class="lede">Announcements are also rendered to a WAV here, newest '
+            "first, so you can check what was said without an Echo in earshot "
+            "&mdash; but that is a <b>local render of the phrase</b>, not proof "
             'Amazon spoke it. For that, read the <span class="mono">alexa OK</span> '
             'line on the <a href="/log">Log</a> tab.</p>']
     if not rows:
@@ -2173,17 +2465,42 @@ CLIP_SERVE_RE = re.compile(
 
 # (role, title, what it is, suggested text). Order is the order callers
 # hear them. Keep in step with VALID_ROLES in orata-clip.sh.
+# (role, title, what it is, suggested text, hover help). Order is the order
+# callers hear them. Keep in step with VALID_ROLES in orata-clip.sh -- note
+# that the CLI also accepts owner-menu, which nothing plays; it is omitted
+# here on purpose.
+#
+# The help text states the fallback honestly per role: the dialplan falls
+# back to a custom/ sound file for the four it plays, but call-from is used
+# only by orata-announce.sh and has NO built-in fallback.
 CLIP_ROLES = [
     ("press-one", "Robocall gate", "Unknown callers hear this before pressing 1.",
-     "Press 1 to continue."),
+     "Press 1 to continue.",
+     "Played to an unknown caller at the gate, before they press 1. If you clear "
+     "this, the dialplan falls back to the installed custom/press-one sound. If "
+     "that file is missing too the caller hears silence and will probably hang "
+     "up -- check Diagnostics before resetting."),
     ("rec-start", "*96 record", "Played before recording starts.",
-     "Speak after the beep, then press hash."),
+     "Speak after the beep, then press hash.",
+     "Played when you dial *96, just before the beep. Falls back to the installed "
+     "custom/rec-start sound when cleared. Only you hear this, so a missing file "
+     "is awkward rather than serious."),
     ("rec-menu", "*96 review menu", "The replay / save / re-record menu.",
-     "Press 1 to replay, 2 to save, 3 to re-record, or star to cancel."),
+     "Press 1 to replay, 2 to save, 3 to re-record, or star to cancel.",
+     "The menu after you finish recording. Falls back to custom/rec-menu. The key "
+     "actions work whether or not you hear them, but re-record what the options "
+     "are if you change them."),
     ("rec-saved", "*96 saved", "Confirmation after a clip is saved.",
-     "Saved."),
+     "Saved.",
+     "Confirmation once a clip is written to the library. Falls back to "
+     "custom/rec-saved. Hearing nothing here does not mean the save failed -- "
+     "check the Log tab for a 'clip OK' line."),
     ("call-from", "Caller name lead-in", "Spliced before recorded caller names in local audio.",
-     "Call from"),
+     "Call from",
+     "Spliced in front of a recorded caller name by orata-announce.sh, for local "
+     "and SIP audio only. This one has NO built-in fallback: if you clear it, "
+     "recorded names play with no lead-in. It does not affect what an Echo says, "
+     "which is always text-to-speech."),
 ]
 
 
@@ -2250,7 +2567,7 @@ def prompts_card():
            '<span class="mono">*96</span> and assign it below. Unset prompts fall '
            "back to installed sound files. Check Diagnostics before resetting: "
            "a missing built-in prompt will be silent.</p>"]
-    for role, title, blurb, suggested in CLIP_ROLES:
+    for role, title, blurb, suggested, tip in CLIP_ROLES:
         inst = role_installed(role)
         src = role_source(role) if inst else ""
         # Prefill with the current text if it was synthesised, so editing
@@ -2264,7 +2581,7 @@ def prompts_card():
         out.append(
             '<div style="border-top:1px solid #222;padding:.75rem 0">'
             '<div class="row" style="align-items:center">'
-            '<b>%s</b>%s<span class="hint" style="margin:0;flex:1;min-width:12rem">%s</span>'
+            '<b>%s</b>%s%s<span class="hint" style="margin:0;flex:1;min-width:12rem">%s</span>'
             "</div>"
             '<div class="row" style="margin-top:.45rem">'
             '<form class="row" method="post" action="/clips/say" style="margin:0">'
@@ -2273,6 +2590,7 @@ def prompts_card():
             '<button class="btn primary" type="submit">synthesise</button></form>'
             "%s%s</div></div>"
             % (esc(title),
+               help_tip(tip),
                ("  " + clip_player("role-%s.wav" % role)) if inst else "",
                esc(src if inst else blurb),
                esc(role), esc(cur, quote=True), esc(suggested, quote=True),
@@ -2416,7 +2734,8 @@ def clips_card():
             'style="margin-right:.4rem"><input type="hidden" name="role" value="%s">'
             '<input type="hidden" name="name" value="%s">'
             '<button class="btn" type="submit">use as %s</button></form>'
-            % (esc(r), esc(stem), esc(t.lower())) for r, t, _b, _suggested in CLIP_ROLES)
+            % (esc(r), esc(stem), esc(t.lower()))
+            for r, t, _b, _suggested, _tip in CLIP_ROLES)
         out.append(
             '<div style="border-top:1px solid #222;padding:.75rem 0">'
             '<div class="row" style="align-items:center">'
@@ -2516,6 +2835,317 @@ def act_clip_broadcast(name: str = Form(...), _=Depends(require_auth)):
 # log
 # =====================================================================
 
+# =====================================================================
+# trunk / Asterisk settings -- writes go through the privileged helper
+#
+# This page is the accepted reversal of the old read-only boundary; see
+# docs/web-ui.md. The UI still cannot write /etc/asterisk itself. Every
+# field below is named in the helper's SCHEMA, which owns validation, so
+# the browser cannot ask for a field the helper has not vetted.
+# =====================================================================
+
+def helper_down_card(err):
+    return ('<div class="card"><h2>Privileged helper unavailable</h2>'
+            '<div class="body"><p class="hint">%s</p>'
+            '<p>Configuration editing and Bluetooth pairing need the '
+            '<span class="mono">orata-admin</span> service:</p>'
+            '<pre>sudo systemctl status orata-admin\n'
+            'sudo systemctl restart orata-admin</pre>'
+            '<p class="hint">Everything else on this UI keeps working; only '
+            "writes to Asterisk configuration and Bluetooth are affected."
+            "</p></div></div>" % esc(err))
+
+
+@app.get("/trunk", response_class=HTMLResponse)
+def page_trunk(request: Request, _=Depends(require_auth)):
+    schema = admin_call("schema", timeout=10)
+    if not schema.get("ok"):
+        return render("/trunk", "orata - trunk",
+                      "<h1>Trunk &amp; phone settings</h1>"
+                      + helper_down_card(schema.get("error", "unknown error")),
+                      flash_of(request))
+    current = admin_call("get", timeout=10).get("values", {})
+    fields = schema.get("fields", {})
+    body = ["<h1>Trunk &amp; phone settings</h1>",
+            '<p class="lede">These write real Asterisk configuration files '
+            "through a privileged helper, keep a numbered backup of each file, "
+            "and need a reload to take effect. Hand-editing still works and is "
+            "still authoritative &mdash; this reads the same files.</p>"]
+    order = ["trunk.pop", "trunk.username", "trunk.password", "voicemail.pin"]
+    body.append('<div class="card"><h2>Settings'
+                '<span class="note">writes /etc/asterisk</span></h2>'
+                '<div class="body">')
+    for key in order:
+        meta = fields.get(key)
+        if not meta:
+            continue
+        val = current.get(key, "")
+        secret = key.endswith("password") or key.endswith("pin")
+        shown = "" if secret else val
+        state = "set" if val else "not set"
+        body.append(
+            '<div style="border-top:1px solid #222;padding:.75rem 0">'
+            '<div class="row" style="align-items:center">'
+            '<b>%s</b>%s'
+            '<span class="hint" style="margin:0;flex:1;min-width:10rem">'
+            '%s &middot; <span class="mono">[%s] %s</span></span></div>'
+            '<form class="row" method="post" action="/trunk/set" '
+            'style="margin:.45rem 0 0">'
+            '<input type="hidden" name="field" value="%s">'
+            '<input class="in" type="%s" name="value" value="%s" size="38" '
+            'placeholder="%s" autocomplete="off">'
+            '<button class="btn primary" type="submit">save</button>'
+            "</form></div>"
+            % (esc(meta["label"]), help_tip(meta["help"]),
+               esc(state), esc(meta["section"]), esc(meta["option"]),
+               esc(key), "password" if secret else "text",
+               esc(shown, quote=True),
+               "unchanged" if secret and val else ""))
+    body.append("</div></div>")
+    body.append('<div class="card"><h2>Apply changes</h2><div class="body">'
+                '<p class="hint">Asterisk keeps running the old settings until '
+                "you reload. A reload briefly drops trunk registration; avoid it "
+                "during a call.</p><div class=\"row\">"
+                + "".join(
+                    '<form class="inline" method="post" action="/trunk/reload">'
+                    '<input type="hidden" name="what" value="%s">'
+                    '<button class="btn" type="submit">reload %s</button></form>'
+                    % (w, w) for w in ("pjsip", "dialplan", "voicemail"))
+                + "</div></div></div>")
+    backups = admin_call("backups", timeout=10).get("backups", [])
+    body.append('<div class="card"><h2>Config backups'
+                '<span class="note">newest %d</span></h2><div class="body">'
+                '<p class="hint">Every write copies the file first, into '
+                '<span class="mono">/var/lib/orata/config-backups</span>. '
+                "Restore one by hand over SSH; there is deliberately no "
+                "restore button.</p>%s</div></div>"
+                % (len(backups),
+                   "<pre>%s</pre>" % esc("\n".join(backups[:20]))
+                   if backups else '<div class="empty">none yet</div>'))
+    return render("/trunk", "orata - trunk", "".join(body), flash_of(request))
+
+
+@app.post("/trunk/set")
+def act_trunk_set(field: str = Form(...), value: str = Form(""),
+                  _=Depends(require_auth)):
+    if not value.strip():
+        return back("nothing entered; field unchanged", True, "/trunk")
+    reply = admin_call("set", field=field, value=value)
+    if not reply.get("ok"):
+        return back(reply.get("error", "write failed"), True, "/trunk")
+    note = reply.get("note", "")
+    return back("saved" + (" -- %s" % note if note else ""), False, "/trunk")
+
+
+@app.post("/trunk/reload")
+def act_trunk_reload(what: str = Form(...), _=Depends(require_auth)):
+    reply = admin_call("reload", what=what, timeout=30)
+    if not reply.get("ok"):
+        return back(reply.get("error") or reply.get("output", "reload failed"),
+                    True, "/trunk")
+    return back("%s reloaded" % what, False, "/trunk")
+
+
+# =====================================================================
+# bluetooth -- discovery and pairing via the privileged helper
+# =====================================================================
+
+@app.get("/speaker", response_class=HTMLResponse)
+def page_speaker(request: Request, _=Depends(require_auth)):
+    """Choose the speaker the callback bridge speaks through.
+
+    Bluetooth is one way to obtain a speaker, not a requirement. The Pi's
+    own headphone/HDMI output is an ordinary PipeWire sink and works here
+    identically -- a wired speaker next to the Echo is arguably the more
+    reliable choice, since nothing has to re-pair after a reboot.
+    """
+    body = ["<h1>Echo bridge speaker</h1>",
+            '<p class="lede">The experimental callback bridge plays a spoken '
+            "command out loud so a nearby Echo hears it and places a call. "
+            "This page picks which physical output it speaks through. "
+            "<b>A normal phone setup does not need any of this.</b></p>",
+            '<p class="lede">Any audio output works &mdash; the Pi\'s own '
+            "headphone or HDMI jack, a USB speaker, or Bluetooth. For the "
+            "prompts callers hear down the phone, see "
+            '<a href="/audio">Recordings</a> instead.</p>']
+    if not admin_available():
+        body.append(helper_down_card("helper socket not present"))
+        return render("/speaker", "orata - speaker", "".join(body),
+                      flash_of(request))
+    state = admin_call("audio.state", timeout=20)
+    sinks = state.get("sinks", [])
+    configured = state.get("configured", "")
+    present = state.get("present", False)
+
+    rows = []
+    if not state.get("installed"):
+        rows.append('<p class="hint">The callback bridge is not installed on '
+                    "this Pi, so there is nothing to point at a speaker. "
+                    "Sinks are listed below for reference.</p>")
+    else:
+        if configured and present:
+            rows.append('<p>%s Bridge is pointed at <span class="mono">%s</span>, '
+                        "and that sink is connected now.</p>"
+                        % (pill("pass"), esc(configured)))
+        elif configured:
+            rows.append('<p>%s Bridge is pointed at <span class="mono">%s</span>, '
+                        "but PipeWire does not currently report that sink. The "
+                        "speaker is off, out of range, or was replaced. A call "
+                        "would fail at playback.</p>"
+                        % (pill("fail"), esc(configured)))
+        else:
+            rows.append('<p>%s No sink configured for the bridge yet.</p>'
+                        % pill("warn"))
+
+    if sinks and state.get("installed"):
+        opts = "".join(
+            '<option value="%s"%s>%s%s</option>'
+            % (esc(s["name"], quote=True),
+               " selected" if s["name"] == configured else "",
+               esc(s["desc"] or s["name"]),
+               "" if s["name"] == configured else "")
+            for s in sinks)
+        rows.append(
+            '<form class="row" method="post" action="/speaker/target" '
+            'style="margin:.6rem 0 0">'
+            '<select class="in" name="target">%s</select>'
+            '<button class="btn primary" type="submit">use for callback bridge</button>'
+            "</form>"
+            '<p class="hint">This writes <span class="mono">target</span> into '
+            '<span class="mono">/etc/orata/alexa-bridge.conf</span> and keeps a '
+            "backup. Previously that name was copied by hand, and nothing "
+            "checked the two agreed.</p>" % opts)
+
+    prompt_info = state.get("prompt_info") or {}
+    if state.get("installed"):
+        if not prompt_info.get("exists"):
+            rows.append('<p class="hint">%s No pinned prompt at '
+                        '<span class="mono">%s</span>. The bridge plays this '
+                        "recording to wake the Echo; without it, nothing is "
+                        "spoken.</p>" % (pill("fail"), esc(state.get("prompt", ""))))
+        elif not prompt_info.get("valid"):
+            rows.append('<p class="hint">%s The pinned prompt is not a PCM WAV '
+                        "of 0.2 to 12 seconds, so the audio worker will reject "
+                        "it.</p>" % pill("fail"))
+        else:
+            rows.append('<p class="hint">%s Pinned prompt is %.2fs at %d Hz.'
+                        " Remember it speaks the callback number aloud: if you "
+                        "change that number, re-record and re-pin it.</p>"
+                        % (pill("pass"), prompt_info.get("seconds", 0),
+                           prompt_info.get("rate", 0)))
+        rows.append('<form class="inline" method="post" action="/speaker/restart">'
+                    '<button class="btn" type="submit">restart audio worker</button>'
+                    "</form>")
+
+    body.append('<div class="card"><h2>Callback bridge audio'
+                '<span class="note">PipeWire</span></h2><div class="body">%s'
+                "</div></div>" % "".join(rows))
+
+    # --- Bluetooth: one way to get a speaker, not the only one -----------
+    # Deliberately below the selector. A wired speaker on the headphone jack
+    # needs nothing from this section, and putting pairing first implied
+    # Bluetooth was required.
+    known = (admin_call("bt.scan", seconds=12, timeout=45)
+             if request.query_params.get("scan") else {"devices": []})
+    bt = ['<p class="hint" style="margin-top:0">Skip this entirely if your '
+          "speaker is plugged into the Pi's headphone or HDMI jack, or is a "
+          "USB speaker &mdash; those appear in the list above with no setup. "
+          "Bluetooth is the least reliable option here, because the speaker "
+          "has to reconnect by itself after a reboot.</p>"
+          '<p class="hint">Put the speaker in pairing mode first, usually by '
+          "holding its Bluetooth button until it flashes. Scanning does not "
+          "interrupt calls.</p>"
+          '<a class="btn primary" href="/speaker?scan=1">scan for devices</a>']
+    devices = known.get("devices", [])
+    if devices:
+        for dev in devices:
+            info = admin_call("bt.info", mac=dev["mac"], timeout=10).get("info", {})
+            dstate = "paired" if info.get("paired") else "new"
+            if info.get("connected"):
+                dstate = "connected"
+            bt.append(
+                '<div style="border-top:1px solid #222;padding:.6rem 0;'
+                'margin-top:.6rem">'
+                '<div class="row" style="align-items:center">'
+                '<b>%s</b><span class="mono hint" style="margin:0">%s</span>'
+                '%s<span style="flex:1"></span>'
+                '<form class="inline" method="post" action="/speaker/pair">'
+                '<input type="hidden" name="mac" value="%s">'
+                '<button class="btn primary" type="submit">pair &amp; connect</button>'
+                "</form>"
+                '<form class="inline" method="post" action="/speaker/forget">'
+                '<input type="hidden" name="mac" value="%s">'
+                '<button class="btn sm danger" type="submit">forget</button>'
+                "</form></div></div>"
+                % (esc(dev.get("name") or "(unnamed)"), esc(dev["mac"]),
+                   pill("pass" if dstate == "connected" else
+                        "info" if dstate == "paired" else "skip"),
+                   esc(dev["mac"]), esc(dev["mac"])))
+    elif request.query_params.get("scan"):
+        bt.append('<div class="empty">nothing found &mdash; is the speaker in '
+                  "pairing mode?</div>")
+    body.append('<div class="card"><h2>Bluetooth pairing'
+                '<span class="note">optional</span></h2>'
+                '<div class="body">%s</div></div>' % "".join(bt))
+
+    body.append('<div class="card"><h2>All audio outputs</h2><div class="body">'
+                '<p class="hint" style="margin-top:0">Everything PipeWire can '
+                "play to, whatever the connection. "
+                '<span class="mono">alsa_output.*</span> is the Pi\'s own '
+                'hardware; <span class="mono">bluez_output.*</span> is '
+                "Bluetooth.</p>%s</div></div>"
+                % ("<pre>%s</pre>" % esc("\n".join(
+                    "%s    %s" % (s["name"], s["desc"]) for s in sinks))
+                   if sinks else '<div class="empty">no outputs visible &mdash; '
+                   "is the desktop session running?</div>"))
+    return render("/speaker", "orata - speaker", "".join(body),
+                  flash_of(request))
+
+
+@app.post("/speaker/target")
+def act_speaker_target(target: str = Form(...), _=Depends(require_auth)):
+    reply = admin_call("audio.target", target=target, timeout=30)
+    if not reply.get("ok"):
+        return back(reply.get("error", "could not set output"), True, "/speaker")
+    return back("bridge will use %s -- %s" % (reply.get("target", ""),
+                                              reply.get("note", "")),
+                False, "/speaker")
+
+
+@app.post("/speaker/restart")
+def act_speaker_restart(_=Depends(require_auth)):
+    reply = admin_call("audio.restart", timeout=30)
+    if not reply.get("ok"):
+        return back(reply.get("output") or "restart failed", True, "/speaker")
+    return back("audio worker restarted", False, "/speaker")
+
+
+@app.post("/speaker/pair")
+def act_speaker_pair(mac: str = Form(...), _=Depends(require_auth)):
+    reply = admin_call("bt.pair", mac=mac, timeout=70)
+    if not reply.get("ok"):
+        steps = reply.get("steps") or []
+        why = next((s["detail"] for s in reversed(steps) if s.get("detail")),
+                   reply.get("error", "pairing failed"))
+        return back("pair failed: %s" % why, True, "/speaker?scan=1")
+    return back("paired, trusted and connected -- now select it above",
+                False, "/speaker?scan=1")
+
+
+@app.post("/speaker/forget")
+def act_speaker_forget(mac: str = Form(...), _=Depends(require_auth)):
+    reply = admin_call("bt.remove", mac=mac, timeout=20)
+    if not reply.get("ok"):
+        return back(reply.get("error", "remove failed"), True, "/speaker")
+    return back("device forgotten", False, "/speaker")
+
+
+# Old path, in case a browser has it bookmarked from the first build.
+@app.get("/bluetooth")
+def page_bluetooth_moved():
+    return RedirectResponse("/speaker", status_code=308)
+
+
 @app.get("/log", response_class=HTMLResponse)
 def page_log(request: Request, _=Depends(require_auth)):
     lines = log_tail(200)
@@ -2552,7 +3182,11 @@ def main():
     if not TOKEN:
         sys.stderr.write(
             "orata-web: ORATA_WEB_TOKEN is empty in %s -- refusing to start.\n"
-            "Generate one with:  head -c 24 /dev/urandom | base64\n" % CONF_PATH)
+            "Generate one with:\n"
+            "  head -c 24 /dev/urandom | base64 | tr '+/' '-_' | tr -d '='\n"
+            "The tr is required: a literal '+' in a ?token= URL decodes to a\n"
+            "space, so a plain-base64 token makes the one-shot link 401.\n"
+            % CONF_PATH)
         sys.exit(1)
     if BIND in ("0.0.0.0", "::") and CFG.get("ORATA_WEB_ALLOW_ANY_BIND") != "1":
         sys.stderr.write(

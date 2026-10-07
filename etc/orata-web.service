@@ -9,8 +9,11 @@
 
 [Unit]
 Description=orata web admin
-After=asterisk.service
-Wants=asterisk.service
+# orata-firstboot must finish first: on a cloned appliance image it
+# generates the per-device admin password, so serving before it completes
+# would expose an unprovisioned instance.
+After=asterisk.service orata-firstboot.service orata-admin.service
+Wants=asterisk.service orata-admin.service
 
 [Service]
 Type=simple
@@ -20,7 +23,9 @@ ExecStart=/usr/bin/python3 /usr/local/bin/orata_web.py
 Restart=on-failure
 RestartSec=5
 
-# It needs the Asterisk CLI socket and its own config; nothing else.
+# It needs the Asterisk CLI socket, its own config, and the privileged
+# helper's socket in /run/orata-admin. It still cannot write /etc/asterisk:
+# that is the helper's job and the reason the helper exists.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

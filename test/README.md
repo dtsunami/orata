@@ -4,8 +4,10 @@ Four verification paths live here:
 
 - **`alexa_callback.py`** — isolated experimental callback coordinator/AGI
   and fixed audio worker tests. Mocks live CLI and playback; no SIP/Amazon
-  traffic. Run `python3 test/alexa_callback.py`. Live bridging and teardown
-  still require the acceptance tests in [callback guide](../docs/alexa-callback.md).
+  traffic. Covers separate main/callback DIDs, shared mobile/Echo CID,
+  fail-closed callback routing and config/global consistency. Run
+  `python3 test/alexa_callback.py`. Live bridging and teardown still require
+  the acceptance tests in [callback guide](../docs/alexa-callback.md).
 
 - **`regression.py`** — current isolated UI/audio/ARC checks. All 19 passed
   on 2026-10-04. It mocks Asterisk and ARC; it does not validate Amazon login.

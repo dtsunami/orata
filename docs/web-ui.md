@@ -133,6 +133,54 @@ The Diagnostics tab *detects and reports* every one of these — stubbed
 credentials, missing ntfy URL, selftest context not loaded — and tells you
 which file to edit. Reporting is the boundary.
 
+`/etc/orata/alexa-bridge.conf` joins that list: the callback bridge's DIDs,
+caller IDs and sink name are hand-edited with `sudoedit`, and the pinned
+prompt WAV is installed by hand. Nothing in the UI reads or writes them.
+
+## Boundary reversal, accepted 2026-10-04 — appliance image
+
+**The read-only boundary above is superseded for the appliance build.** The
+product changed: Orata is now a cloned Raspberry Pi 4 image that a user
+powers on and configures entirely from the browser. There is no hand-editing
+step for that user, so "Diagnostics reports it, you `sudoedit` the file" is
+not a usable answer. The UI now gets write access to Asterisk configuration
+and live BlueZ pairing, plus username/password authentication.
+
+The original objection was correct for a hand-built Pi and is not withdrawn
+on its merits. What changed is the alternative: an appliance whose owner
+cannot edit `pjsip.conf` has no path to a working trunk at all.
+
+Accepting this means accepting a real increase in exposure, so the following
+are **conditions of the reversal, not refinements**:
+
+1. **No shared secrets in the image.** A cloned image means every unit ships
+   identical. Any password, token, SSH host key or SIP credential baked into
+   it is public the moment one image leaks. The image ships with none; a
+   first-boot unit generates per-device credentials before the UI serves a
+   single page.
+2. **Forced credential change on first login.** A default password that can
+   remain set is the router failure mode being copied here. First boot
+   generates a random one; the UI refuses all other routes until it is
+   changed.
+3. **Writes go through a privileged helper with a fixed command surface**,
+   not by widening the web service's own privileges. The helper validates
+   every field, writes via temp-file-and-rename, keeps a numbered backup, and
+   never accepts a free-text config blob. This reuses the pattern already
+   proven in `orata-audio-worker.py`: unix socket, `SO_PEERCRED` check,
+   enumerated operations.
+4. **Toll-fraud containment stays mandatory.** The trunk can dial
+   premium-rate numbers. Portal spending cap, international block and IP
+   restriction are not optional for an appliance, and the UI must surface
+   their state rather than assume them.
+5. **Still no TLS, still no public exposure.** Username/password over plain
+   HTTP on a LAN is the accepted posture, identical to a consumer router.
+   Port-forwarding this remains prohibited; remote access is WireGuard.
+
+Hand-editing continues to work and remains authoritative for anyone who
+prefers it. The helper reads and rewrites the same files rather than owning
+a separate database, so a hand edit is never clobbered silently — but a
+UI write and a concurrent `sudoedit` can still race, and last-write-wins.
+
 ## Dashboard and Configure
 
 `/` is the landing page after the token is exchanged for a cookie. It shows
@@ -364,9 +412,37 @@ Real synthesis coverage needs `espeak-ng` (or `espeak`) and `sox`; absent
 dependencies produce an explicit skip. Dialplan checks here are structural,
 not proof of runtime hangup handling. Browser appearance needs visual review.
 
+## Pages not documented in detail
+
+`/diag` and `/devices` are substantial pages with no section of their own
+here. Briefly, until that is written:
+
+- **`/diag`** runs five grouped probe sets — platform, dialplan, pjsip,
+  announce, media — and reports stubbed credentials, missing prompt files,
+  an unloaded selftest context and absent sound paths. It only reports;
+  every fix is a hand edit in the file it names.
+- **`/devices`** parses `pjsip.conf` sections and live contacts to show each
+  SIP endpoint, its registration state and the LAN address to point a
+  handset at. Read-only, like the rest.
+
 ## Known gaps
 
 - **No TLS.** SSH tunnel or WireGuard only.
+- **Tooltips are uneven.** `help_tip()` is called on status cards, Configure
+  rows, book headings and the spoken-prompt rows. Diagnostics rows carry
+  their own inline `→ hint` text instead. Still bare: the Harness buttons,
+  the Devices cards, and the caller-name recording fields.
+- **No in-browser audio recording, and none planned.** `getUserMedia`
+  requires a secure context: with no TLS, a browser grants microphone access
+  only over an SSH tunnel to `127.0.0.1`, and silently refuses on a LAN or
+  WireGuard address. Record prompts by dialling `*96` from a handset, which
+  also captures them through the same 8 kHz telephone path they are played
+  back on. Synthesised prompts come from `orata-clip.sh say`.
+- **No Bluetooth discovery or pairing.** The UI runs as `asterisk` with
+  `NoNewPrivileges`; BlueZ pairing needs privileged D-Bus and an interactive
+  agent. Pair the speaker once with `bluetoothctl`. The callback bridge's
+  own failure mode — sink missing after a reboot — is visible in
+  `/var/log/orata/alexa-bridge.log`, not in this UI.
 - **No rate limit on the token.** A LAN attacker can brute force it; 24 random
   bytes makes that impractical, but it is not defence in depth.
 - **No CSRF token.** `SameSite=Strict` on the cookie is the only protection.

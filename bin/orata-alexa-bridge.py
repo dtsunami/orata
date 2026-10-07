@@ -31,6 +31,7 @@ class Config:
         self.enabled = cfg.getboolean("enabled", fallback=False)
         self.callback = cfg.get("callback_caller_id", "").strip()
         self.did = cfg.get("destination", "").strip()
+        self.callback_did = cfg.get("callback_destination", "").strip()
         self.allowed = {n.strip() for n in cfg.get("allowed_callers", "").split(",") if n.strip()}
         self.state_dir = Path(cfg.get("state_dir", "/var/lib/orata/alexa-bridge"))
         self.audio_socket = cfg.get("audio_socket", "/run/orata-audio/play.sock")
@@ -45,12 +46,18 @@ class Config:
         if self.enabled:
             if not cfg.getboolean("acknowledge_spoofable_callback", fallback=False):
                 raise ValueError("explicit spoofable-callback risk acknowledgement required")
-            if not all(re.fullmatch(r"[0-9]{7,15}", n) for n in (self.callback, self.did)):
-                raise ValueError("exact numeric callback CID and destination required")
+            if not all(re.fullmatch(r"[0-9]{7,15}", n)
+                       for n in (self.callback, self.did, self.callback_did)):
+                raise ValueError("exact numeric callback CID, main DID and callback DID required")
+            # DIDs match exact received digits, but reject a 10/11-digit US
+            # alias of the same number as well as literal equality.
+            def us_digits(n):
+                return n[1:] if len(n) == 11 and n.startswith("1") else n
+            if us_digits(self.did) == us_digits(self.callback_did):
+                raise ValueError("main and callback DIDs must be different numbers")
             if not self.allowed or any(not re.fullmatch(r"[0-9]{7,15}", n) for n in self.allowed):
                 raise ValueError("explicit numeric test callers required; no wildcard")
-            if self.callback in self.allowed:
-                raise ValueError("callback CID cannot originate bridge requests")
+            # Mobile and Echo may share a CID: the called DID identifies the role.
 
 
 class Store:
@@ -112,9 +119,11 @@ class Store:
 
     def claim(self, caller, destination, channel, now=None):
         now = time.time() if now is None else now
-        if not self.cfg.enabled or caller != self.cfg.callback:
+        if destination != self.cfg.callback_did:
+            # Even the Echo's CID is an ordinary caller on the main DID.
             return "NORMAL", None
-        if destination != self.cfg.did:
+        if not self.cfg.enabled or caller != self.cfg.callback:
+            # Reserve the callback destination regardless of caller identity.
             return "REJECT", None
         with self.transaction() as state:
             session = state.get("session")
@@ -138,8 +147,9 @@ class Store:
             session = state.get("session")
             if not session or session["token"] != token:
                 return None
-            session["phase"] = "ended" if session["connected"] else "fallback"
-            session["reason"] = reason
+            if session["phase"] not in ("ended", "fallback"):
+                session["phase"] = "ended" if session["connected"] else "fallback"
+                session["reason"] = reason
             return dict(session)
 
     def release(self, token, now=None):
@@ -214,6 +224,7 @@ def watch(cfg, store, token):
         audio.settimeout(2)
         audio.connect(cfg.audio_socket)
         audio.sendall(b"PLAY\n")
+        LOG.info("playback requested for session %s", token)
         audio.setblocking(False)
         response = b""
         audio_deadline = time.monotonic() + 20
@@ -240,6 +251,7 @@ def watch(cfg, store, token):
                         audio = None
                         if response.strip() != b"OK":
                             raise RuntimeError("fixed audio playback failed")
+                        LOG.info("playback completed for session %s", token)
                 if audio is not None and time.monotonic() >= audio_deadline:
                     raise RuntimeError("audio timed out")
             together = in_room(live, current["callback"], current["room"])
@@ -267,6 +279,7 @@ def watch(cfg, store, token):
         if audio is not None:
             audio.close()
         stopped = store.stop(token, "watch-ended")
+        LOG.info("session %s finished: %s", token, (stopped or last).get("reason", "unknown"))
         teardown(stopped or last)
 
 
@@ -304,18 +317,22 @@ def main():
     reserved = None
     store = None
     try:
-        agi.set("AB_ACTION", "NORMAL")
+        destination = agi.env.get("agi_extension", "")
+        # The dialplan independently reserves this DID, even when INI/config
+        # validation fails. Set the same safe default before reading the file.
+        callback_hint = agi.env.get("agi_arg_2", "") if action == "route" else agi.env.get("agi_arg_3", "")
+        reject = action == "route" and bool(callback_hint) and destination == callback_hint
+        agi.set("AB_ACTION", "REJECT" if reject else "NORMAL")
         agi.set("AB_RESULT", "FALLBACK")
         cfg = Config(path)
+        if action == "route" and cfg.callback_did and destination == cfg.callback_did:
+            agi.set("AB_ACTION", "REJECT")
         if not cfg.enabled:
             return
+        if action in ("route", "offer") and callback_hint != cfg.callback_did:
+            raise ValueError("callback DID global and INI config must match")
         caller = agi.env.get("agi_callerid", "")
-        destination = agi.env.get("agi_extension", "")
         channel = agi.env.get("agi_channel", "")
-        # Identify the reserved CID before accessing state: corrupt/unwritable
-        # state must not turn a callback into another originating request.
-        if action == "route" and caller == cfg.callback:
-            agi.set("AB_ACTION", "REJECT")
         store = Store(cfg)
         if action == "route":
             outcome, session = store.claim(caller, destination, channel)
